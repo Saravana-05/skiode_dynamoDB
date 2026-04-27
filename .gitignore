@@ -53,8 +53,8 @@ env/
 *.sqlite3
 
 # Environment variables
-!.env 
-!.env.*
+.env
+.env.*
 
 # OS files
 .DS_Store
