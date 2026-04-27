@@ -1,0 +1,95 @@
+[auth]
+
+get_user_full = """
+SELECT
+    u.id as user_id,
+    u.password,
+    u.is_superuser,
+    u.is_active as user_active,
+
+
+    ud.id as userdata_id,
+    ud.user_name,
+    ud.mail_id,
+    ud.profile_pic,
+    ud.user_profile_schema,
+    ud.is_lead,
+    ud.organization_id,
+    ud.usergroup_id,
+    ud.is_active as userdata_active,
+
+    o.id as org_id,
+    o.org_code,
+
+    ug.id as group_id,
+    ug.group_name,
+    ug.ref_id as group_ref_id,
+
+    ac.auth_type,
+    ac.is_enabled,
+    ac.okta_issuer,
+    ac.okta_client_id
+
+FROM form_generator_userdata ud
+LEFT JOIN auth_user u ON ud.user_id = u.id
+LEFT JOIN custom_components_organization o ON ud.organization_id = o.id
+LEFT JOIN custom_components_usergroup ug ON ud.usergroup_id = ug.id
+LEFT JOIN custom_components_organizationauthconfig ac ON ac.organization_id = o.id
+
+WHERE LOWER(ud.mail_id) = LOWER($1)
+"""
+
+get_user_by_email = """
+SELECT id FROM auth_user WHERE email = $1;
+"""
+
+get_userdata_by_email = """
+SELECT id
+FROM form_generator_userdata
+WHERE LOWER(mail_id) = LOWER($1);
+"""
+
+check_username = """
+SELECT id FROM auth_user WHERE username = $1;
+"""
+
+create_user = """
+INSERT INTO auth_user (
+    username,
+    email,
+    password,
+    is_superuser,
+    is_staff,
+    is_active,
+    date_joined,
+    first_name,
+    last_name
+)
+VALUES ($1, $2, $3, $4, $5, $6, $7, '', '')
+RETURNING id;
+"""
+
+
+create_userdata = """
+INSERT INTO form_generator_userdata (
+    user_name,
+    mail_id,
+    password,
+    is_active,
+    organization_id,
+    user_id
+)
+VALUES ($1, $2, $3, $4, $5, $6);
+"""
+
+update_password = """
+UPDATE auth_user
+SET password = $1
+WHERE id = $2;
+"""
+
+update_userdata_password = """
+UPDATE form_generator_userdata
+SET password = $1
+WHERE user_id = $2;
+"""

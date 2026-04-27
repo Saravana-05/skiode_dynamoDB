@@ -1,0 +1,13 @@
+db name -  skiode-db
+username - skiodefastapi
+pw -skiode123
+
+
+endpoint - skiode-db.cdaewk8sw59l.ap-south-1.rds.amazonaws.com
+
+port -5432
+
+db name- skiode-db
+
+
+postgresql://skiodefastapi:skiode123@skiode-db.cdaewk8sw59l.ap-south-1.rds.amazonaws.com:5432/skiode-db

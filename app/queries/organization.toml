@@ -1,0 +1,46 @@
+[organization]
+
+get_by_code = """
+SELECT id
+FROM custom_components_organization
+WHERE org_code = $1
+"""
+
+create = """
+INSERT INTO custom_components_organization (
+    org_name,
+    org_code,
+    email,
+    org_description,
+    large_logo_url,
+    small_logo_url,
+    primary_color,
+    secondary_color,
+    accent1_color,
+    accent2_color,
+    accent3_color,
+    bot_id,
+    admin_set_password
+)
+VALUES (
+    $1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13
+)
+RETURNING *
+"""
+
+get_auth_config_by_org = """
+SELECT id
+FROM custom_components_organizationauthconfig
+WHERE organization_id = $1;
+"""
+
+create_auth_config = """
+INSERT INTO custom_components_organizationauthconfig (
+    organization_id,
+    auth_type,
+    okta_issuer,
+    okta_client_id,
+    is_enabled
+)
+VALUES ($1, $2, $3, $4, $5);
+"""

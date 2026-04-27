@@ -1,0 +1,16 @@
+{
+  "permissions": {
+    "allow": [
+      "Bash(xargs grep *)",
+      "Bash(\"G:/skiode_lambda_backend/fastapi_service/fastapi_service/venv/Scripts/pip.exe\" show *)",
+      "Bash(\"G:/skiode_lambda_backend/fastapi_service/fastapi_service/venv/Scripts/pip.exe\" list *)",
+      "Bash(venv/Scripts/python -m app.db.seed_form_data)",
+      "Bash(./venv/Scripts/python.exe -m app.db.seed_form_data)",
+      "Bash(\"G:/skiode_lambda_backend/fastapi_service/fastapi_service/venv/Scripts/python.exe\" --version)",
+      "Bash(python -m venv venv_new)",
+      "Bash(venv_new/Scripts/pip install *)",
+      "Bash(venv_new/Scripts/python.exe -m app.db.seed_form_data)",
+      "Bash(find \"G:\\\\skiode_lambda_backend\\\\fastapi_service\\\\fastapi_service\\\\app\\\\routers\" -name \"__init__.py\" -exec cat {} \\\\;)"
+    ]
+  }
+}

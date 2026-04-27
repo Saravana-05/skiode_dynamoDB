@@ -1,0 +1,41 @@
+[calendar_account]
+
+create = """
+INSERT INTO calendar_accounts
+(organization_id, user_id, provider, access_token, refresh_token, token_expiry)
+VALUES ($1,$2,$3,$4,$5,$6)
+
+ON CONFLICT (user_id, provider)
+DO UPDATE SET
+    access_token = EXCLUDED.access_token,
+    refresh_token = EXCLUDED.refresh_token,
+    token_expiry = EXCLUDED.token_expiry,
+    is_active = TRUE,
+    updated_at = CURRENT_TIMESTAMP
+
+RETURNING id, organization_id, user_id, provider;
+"""
+
+get_user_accounts = """
+SELECT id, organization_id, user_id, provider, access_token, refresh_token, token_expiry, is_active
+FROM calendar_accounts
+WHERE user_id = $1 AND is_active = true;
+"""
+
+get_provider_account = """
+SELECT *
+FROM calendar_accounts
+WHERE user_id = $1 AND provider = $2;
+"""
+
+deactivate = """
+UPDATE calendar_accounts
+SET is_active = FALSE
+WHERE id = $1;
+"""
+
+update_tokens = """
+UPDATE calendar_accounts
+SET access_token = $1, refresh_token = $2, updated_at = NOW()
+WHERE id = $3;
+"""

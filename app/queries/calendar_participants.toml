@@ -1,0 +1,49 @@
+[calendar_participants]
+
+create = """
+INSERT INTO calendar_participants
+(
+event_id,
+user_id,
+role,
+name,
+email,
+status,
+extra
+)
+VALUES ($1,$2,$3,$4,$5,$6,$7)
+RETURNING id;
+"""
+
+get_by_event = """
+SELECT *
+FROM calendar_participants
+WHERE event_id = $1
+ORDER BY id ASC;
+"""
+
+get_by_email = """
+SELECT *
+FROM calendar_participants
+WHERE email = $1
+ORDER BY created_at DESC;
+"""
+
+get_events_by_email = """
+SELECT
+    e.*
+FROM calendar_events e
+JOIN calendar_participants p
+    ON e.id = p.event_id
+WHERE p.email = $1
+AND e.start_datetime >= $2
+AND e.end_datetime <= $3
+ORDER BY e.start_datetime DESC;
+"""
+
+update_status = """
+UPDATE calendar_participants
+SET status = $2,
+    updated_at = CURRENT_TIMESTAMP
+WHERE id = $1;
+"""
