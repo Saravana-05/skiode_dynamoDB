@@ -58,7 +58,7 @@ async def create_table(body: CreateTableRequest):
     - Each schema field will become its own separate column on row insert
     """
     try:
-        from ..db.repositories.dynamo.datastore_repo import create_table_from_schema, save_schema
+        from ..db.repositories.datastore_repo import create_table_from_schema, save_schema
 
         schema = [f.model_dump() for f in body.schema]
         result = await create_table_from_schema(body.table_name, schema)
@@ -102,7 +102,7 @@ async def insert_row(table_name: str, body: dict[str, Any] = Body(...)):
     4. Stores each field as its own separate column — NOT as JSON
     """
     try:
-        from ..db.repositories.dynamo.datastore_repo import get_schema, insert_row as _insert
+        from ..db.repositories.datastore_repo import get_schema, insert_row as _insert
 
         schema = await get_schema(table_name)
         if not schema:
@@ -144,7 +144,7 @@ async def insert_row(table_name: str, body: dict[str, Any] = Body(...)):
 @router.get("/{table_name}/rows", summary="List all rows in a dynamic table")
 async def list_rows(table_name: str):
     try:
-        from ..db.repositories.dynamo.datastore_repo import list_rows as _list
+        from ..db.repositories.datastore_repo import list_rows as _list
         rows = await _list(table_name)
         return {"status": "success", "table_name": table_name, "count": len(rows), "data": rows}
     except Exception as e:
@@ -156,7 +156,7 @@ async def list_rows(table_name: str):
 @router.get("/{table_name}/row/{record_id}", summary="Get one row by ID")
 async def get_row(table_name: str, record_id: str):
     try:
-        from ..db.repositories.dynamo.datastore_repo import get_row as _get
+        from ..db.repositories.datastore_repo import get_row as _get
         row = await _get(table_name, record_id)
         if not row:
             return {"status": "error", "message": "Row not found"}
@@ -170,7 +170,7 @@ async def get_row(table_name: str, record_id: str):
 @router.get("/schemas", summary="List all registered schemas")
 async def list_schemas():
     try:
-        from ..db.repositories.dynamo.datastore_repo import list_schemas as _list
+        from ..db.repositories.datastore_repo import list_schemas as _list
         schemas = await _list()
         return {"status": "success", "count": len(schemas), "schemas": schemas}
     except Exception as e:
@@ -182,7 +182,7 @@ async def list_schemas():
 @router.get("/schemas/{table_name}", summary="Get schema definition for a table")
 async def get_schema(table_name: str):
     try:
-        from ..db.repositories.dynamo.datastore_repo import get_schema as _get
+        from ..db.repositories.datastore_repo import get_schema as _get
         schema = await _get(table_name)
         if not schema:
             return {"status": "error", "message": f"Schema not found for '{table_name}'"}
