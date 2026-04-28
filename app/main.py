@@ -2,7 +2,7 @@ from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
 from .core.config import settings
 from .routers import calendar_account_routes, calendar_event_routes, oauth_routes, \
-    organization_routes, auth_routes, test_routes, employee_routes
+    organization_routes, auth_routes, test_routes, employee_routes, datastore_routes
 from mangum import Mangum
 
 app = FastAPI(title="skiode")
@@ -53,6 +53,7 @@ app.include_router(organization_routes.router)
 app.include_router(auth_routes.router)
 app.include_router(test_routes.router)
 app.include_router(employee_routes.router)
+app.include_router(datastore_routes.router)
 
 
 @app.get("/")

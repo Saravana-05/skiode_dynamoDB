@@ -7,6 +7,12 @@ Usage:
 """
 import asyncio
 import aioboto3
+import os
+from dotenv import load_dotenv
+
+_env_path = os.path.join(os.path.dirname(os.path.dirname(os.path.dirname(__file__))), ".env")
+load_dotenv(_env_path)
+
 from ..core.config import settings
 
 
@@ -156,9 +162,32 @@ TABLE_DEFINITIONS = [
         ],
         "BillingMode": "PAY_PER_REQUEST",
     },
-    # ── Test / form_data table ─────────────────────────────────
+    # ── employee_details table ────────────────────────────────
     {
-        "TableName": "form_data",
+        "TableName": settings.TABLE_EMPLOYEE_DETAILS,
+        "KeySchema": [{"AttributeName": "id", "KeyType": "HASH"}],
+        "AttributeDefinitions": [
+            {"AttributeName": "id",              "AttributeType": "S"},
+            {"AttributeName": "employee_dept",   "AttributeType": "S"},
+            {"AttributeName": "employee_region", "AttributeType": "S"},
+        ],
+        "GlobalSecondaryIndexes": [
+            {
+                "IndexName": "dept-index",
+                "KeySchema": [{"AttributeName": "employee_dept", "KeyType": "HASH"}],
+                "Projection": {"ProjectionType": "ALL"},
+            },
+            {
+                "IndexName": "region-index",
+                "KeySchema": [{"AttributeName": "employee_region", "KeyType": "HASH"}],
+                "Projection": {"ProjectionType": "ALL"},
+            },
+        ],
+        "BillingMode": "PAY_PER_REQUEST",
+    },
+    # ── event_log table ───────────────────────────────────────
+    {
+        "TableName": settings.TABLE_EVENT_LOG,
         "KeySchema": [{"AttributeName": "id", "KeyType": "HASH"}],
         "AttributeDefinitions": [
             {"AttributeName": "id",   "AttributeType": "S"},
@@ -170,6 +199,15 @@ TABLE_DEFINITIONS = [
                 "KeySchema": [{"AttributeName": "name", "KeyType": "HASH"}],
                 "Projection": {"ProjectionType": "ALL"},
             },
+        ],
+        "BillingMode": "PAY_PER_REQUEST",
+    },
+    # ── datastore_schemas table ───────────────────────────────
+    {
+        "TableName": settings.TABLE_SCHEMAS,
+        "KeySchema": [{"AttributeName": "table_name", "KeyType": "HASH"}],
+        "AttributeDefinitions": [
+            {"AttributeName": "table_name", "AttributeType": "S"},
         ],
         "BillingMode": "PAY_PER_REQUEST",
     },
@@ -203,7 +241,7 @@ async def init_tables():
                 desc = await client.describe_table(TableName=name)
                 status = desc["Table"]["TableStatus"]
                 if status == "ACTIVE":
-                    print("ACTIVE ✓")
+                    print("ACTIVE ok")
                     break
                 await asyncio.sleep(2)
 

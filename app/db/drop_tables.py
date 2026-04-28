@@ -6,6 +6,12 @@ Usage:
 """
 import asyncio
 import aioboto3
+import os
+from dotenv import load_dotenv
+
+_env_path = os.path.join(os.path.dirname(os.path.dirname(os.path.dirname(__file__))), ".env")
+load_dotenv(_env_path)
+
 from ..core.config import settings
 
 TABLES = [
@@ -16,7 +22,9 @@ TABLES = [
     settings.TABLE_ORGANIZATIONS,
     settings.TABLE_ORG_AUTH_CONFIGS,
     settings.TABLE_USERGROUPS,
-    "form_data",
+    settings.TABLE_EMPLOYEE_DETAILS,
+    settings.TABLE_SCHEMAS,
+    settings.TABLE_EVENT_LOG,
 ]
 
 

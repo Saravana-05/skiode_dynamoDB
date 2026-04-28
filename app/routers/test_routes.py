@@ -43,12 +43,27 @@ class SaveFormRequest(BaseModel):
 
 # ── WRITE ──────────────────────────────────────────────────────
 
-@router.post("/form-data", summary="💾 Save JSON form fields to DynamoDB")
+@router.post("/form-data", summary="Save form fields — stores in event_log (JSON) + employee_details (columns)")
 async def save_form_data(body: SaveFormRequest):
     try:
-        from ..db.repositories.dynamo.form_data_repo import save
-        record_id = await save(body.name, [f.model_dump() for f in body.fields])
-        return {"status": "success", "record_id": record_id, "fields_saved": len(body.fields)}
+        from ..db.repositories.dynamo.form_data_repo import save as save_event_log
+        from ..db.repositories.dynamo.employee_details_repo import save as save_employee_details
+
+        fields = [f.model_dump() for f in body.fields]
+
+        # Save to event_log (fields as JSON string)
+        event_log_id = await save_event_log(body.name, fields)
+
+        # Save to employee_details (each field as a separate column)
+        employee_details_id = await save_employee_details(body.name, fields, event_log_id)
+
+        return {
+            "status": "success",
+            "event_log_id": event_log_id,
+            "employee_details_id": employee_details_id,
+            "fields_saved": len(body.fields),
+            "stored_in": ["event_log (JSON string)", "employee_details (separate columns)"],
+        }
     except Exception as e:
         return {"status": "error", "message": str(e)}
 
@@ -155,7 +170,7 @@ async def filter_by_field_value(
         return {"status": "error", "message": str(e)}
 
 
-@router.get("/form-data/filter/by-field-type", summary="🐍 [Python filter] Find records by field type")
+@router.get("/form-data/filter/by-field-type", summary="[Python filter] Find records by field type")
 async def filter_by_field_type(field_type: str = Query(..., example="number")):
     """
     Returns all records that contain at least one field of the given type.
@@ -165,5 +180,62 @@ async def filter_by_field_type(field_type: str = Query(..., example="number")):
         from ..db.repositories.dynamo.form_data_repo import filter_by_field_type
         results = await filter_by_field_type(field_type)
         return {"status": "success", "approach": "Python filter (field type)", "count": len(results), "data": results}
+    except Exception as e:
+        return {"status": "error", "message": str(e)}
+
+
+# ── Employee Details routes ─────────────────────────────────────
+
+@router.get("/employee-details", summary="List all employee_details records (separate columns)")
+async def list_employee_details():
+    try:
+        from ..db.repositories.dynamo.employee_details_repo import list_all
+        records = await list_all()
+        return {"status": "success", "count": len(records), "data": records}
+    except Exception as e:
+        return {"status": "error", "message": str(e)}
+
+
+@router.get("/employee-details/{record_id}", summary="Get one employee_details record by ID")
+async def get_employee_detail(record_id: str):
+    try:
+        from ..db.repositories.dynamo.employee_details_repo import get_by_id
+        record = await get_by_id(record_id)
+        if not record:
+            return {"status": "error", "message": "Record not found"}
+        return {"status": "success", "data": record}
+    except Exception as e:
+        return {"status": "error", "message": str(e)}
+
+
+@router.get("/employee-details/filter/by-dept", summary="[GSI] Filter employee_details by department")
+async def filter_employee_by_dept(dept: str = Query(..., example="HR")):
+    try:
+        from ..db.repositories.dynamo.employee_details_repo import filter_by_dept
+        results = await filter_by_dept(dept)
+        return {"status": "success", "count": len(results), "data": results}
+    except Exception as e:
+        return {"status": "error", "message": str(e)}
+
+
+@router.get("/employee-details/filter/by-region", summary="[GSI] Filter employee_details by region")
+async def filter_employee_by_region(region: str = Query(..., example="West")):
+    try:
+        from ..db.repositories.dynamo.employee_details_repo import filter_by_region
+        results = await filter_by_region(region)
+        return {"status": "success", "count": len(results), "data": results}
+    except Exception as e:
+        return {"status": "error", "message": str(e)}
+
+
+@router.get("/employee-details/filter/by-salary", summary="[FilterExpression] Filter employee_details by salary range")
+async def filter_employee_by_salary(
+    min_sal: int = Query(..., example=50000),
+    max_sal: int = Query(..., example=100000),
+):
+    try:
+        from ..db.repositories.dynamo.employee_details_repo import filter_by_salary_range
+        results = await filter_by_salary_range(min_sal, max_sal)
+        return {"status": "success", "count": len(results), "data": results}
     except Exception as e:
         return {"status": "error", "message": str(e)}

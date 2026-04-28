@@ -47,6 +47,9 @@ class Settings(BaseSettings):
     TABLE_ORG_AUTH_CONFIGS: str = "org_auth_configs"
     TABLE_USERGROUPS: str = "usergroups"
     TABLE_EMPLOYEES: str = "employees"
+    TABLE_EVENT_LOG: str = "event_log"
+    TABLE_EMPLOYEE_DETAILS: str = "employee_details"
+    TABLE_SCHEMAS: str = "datastore_schemas"
 
     # django client secret
     DJANGO_SECRET_KEY: str
@@ -67,8 +70,8 @@ class Settings(BaseSettings):
         # Primary: app/.env (where the file actually lives)
         # Fallback: project root .env
         env_file = [
-            os.path.join(os.path.dirname(os.path.dirname(__file__)), ".env"),  # app/.env
-            os.path.join(BASE_DIR, ".env"),                                     # project root .env
+            os.path.join(os.path.dirname(os.path.dirname(os.path.dirname(__file__))), ".env"),  # fastapi_service/.env
+            os.path.join(BASE_DIR, ".env"),                                                       # project root .env
         ]
         env_file_encoding = "utf-8"
         extra = "ignore"
