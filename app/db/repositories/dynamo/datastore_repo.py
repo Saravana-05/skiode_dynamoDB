@@ -8,6 +8,9 @@ Schema field types supported:
     formattedText → DynamoDB S (String)
     boolean       → DynamoDB BOOL
     date          → DynamoDB S (ISO string)
+
+Self-initializing: the datastore_schemas meta-table is created
+automatically on first use if it doesn't exist yet.
 """
 import asyncio
 import json
@@ -22,7 +25,7 @@ from ....core.config import settings
 from ..utils import clean, strip_none
 
 
-# ── type helpers ───────────────────────────────────────────────
+# ── type helpers ────────────────────────────────────────────────
 
 _DYNAMO_TYPE = {
     "text":          "S",
@@ -44,7 +47,7 @@ def _cast(value, field_type: str):
     return str(value) if value is not None else None
 
 
-# ── AWS client kwargs (reused for dynamic table creation) ───────
+# ── AWS client kwargs ────────────────────────────────────────────
 
 def _aws_kwargs() -> dict:
     kwargs = {"region_name": settings.AWS_REGION}
@@ -57,7 +60,59 @@ def _aws_kwargs() -> dict:
     return kwargs
 
 
-# ── schemas meta-table helpers ──────────────────────────────────
+# ── Wait for table to become ACTIVE ─────────────────────────────
+
+async def _wait_active(client, table_name: str, timeout_seconds: int = 60) -> None:
+    """
+    Poll until the DynamoDB table reaches ACTIVE status.
+    Raises TimeoutError if the table is not ACTIVE within `timeout_seconds`.
+    """
+    deadline = asyncio.get_event_loop().time() + timeout_seconds
+    while True:
+        desc = await client.describe_table(TableName=table_name)
+        status = desc["Table"]["TableStatus"]
+        if status == "ACTIVE":
+            return
+        if asyncio.get_event_loop().time() > deadline:
+            raise TimeoutError(
+                f"Table '{table_name}' did not become ACTIVE within {timeout_seconds}s "
+                f"(current status: {status})"
+            )
+        await asyncio.sleep(2)
+
+
+# ── Auto-create the datastore_schemas meta-table ─────────────────
+
+_schemas_table_ready = False   # module-level flag — checked once per process
+
+
+async def _ensure_schemas_table(client) -> None:
+    """
+    Create the datastore_schemas meta-table if it does not exist.
+    Uses a module-level flag so the check runs at most once per process.
+    """
+    global _schemas_table_ready
+    if _schemas_table_ready:
+        return
+
+    existing = set((await client.list_tables())["TableNames"])
+    if settings.TABLE_SCHEMAS not in existing:
+        print(f"[datastore] Creating meta-table '{settings.TABLE_SCHEMAS}'...")
+        await client.create_table(
+            TableName=settings.TABLE_SCHEMAS,
+            KeySchema=[{"AttributeName": "table_name", "KeyType": "HASH"}],
+            AttributeDefinitions=[{"AttributeName": "table_name", "AttributeType": "S"}],
+            BillingMode="PAY_PER_REQUEST",
+        )
+        await _wait_active(client, settings.TABLE_SCHEMAS)
+        print(f"[datastore] Meta-table '{settings.TABLE_SCHEMAS}' is ACTIVE.")
+    else:
+        print(f"[datastore] Meta-table '{settings.TABLE_SCHEMAS}' already exists.")
+
+    _schemas_table_ready = True
+
+
+# ── schemas meta-table helpers ───────────────────────────────────
 
 async def _schemas_table():
     db = get_dynamodb()
@@ -66,6 +121,11 @@ async def _schemas_table():
 
 async def save_schema(table_name: str, schema: list) -> None:
     """Persist the schema definition to the datastore_schemas table."""
+    # Ensure the meta-table exists before writing
+    session = aioboto3.Session()
+    async with session.client("dynamodb", **_aws_kwargs()) as client:
+        await _ensure_schemas_table(client)
+
     tbl = await _schemas_table()
     await tbl.put_item(Item={
         "table_name": table_name,
@@ -98,23 +158,40 @@ async def list_schemas() -> list[dict]:
     return result
 
 
-# ── dynamic table creation ─────────────────────────────────────
+# ── dynamic table creation ───────────────────────────────────────
 
 async def create_table_from_schema(table_name: str, schema: list) -> dict:
     """
-    Create a real DynamoDB table named `table_name`.
-    Primary key is always  id (S).
-    Other schema fields become plain attributes — no GSI by default.
-    Returns {"created": True/False, "table_name": ...}
+    Create a real DynamoDB table named `table_name` in AWS.
+
+    - Primary key: id (S) — HASH key
+    - Billing:     PAY_PER_REQUEST (on-demand, no capacity planning needed)
+    - Region:      settings.AWS_REGION  (default: ap-south-1)
+
+    DynamoDB is schema-less for non-key attributes; the schema fields
+    are stored separately in datastore_schemas (via save_schema).
+
+    Returns:
+        {"created": True,  "table_name": ...}   ← new table
+        {"created": False, "table_name": ..., "reason": "already exists"}
     """
     session = aioboto3.Session()
     async with session.client("dynamodb", **_aws_kwargs()) as client:
 
-        # Check if already exists
+        # Ensure the meta-table exists (idempotent)
+        await _ensure_schemas_table(client)
+
+        # Check if the data table already exists
         existing = set((await client.list_tables())["TableNames"])
         if table_name in existing:
-            return {"created": False, "table_name": table_name, "reason": "already exists"}
+            return {
+                "created": False,
+                "table_name": table_name,
+                "reason": "already exists",
+            }
 
+        # Create the table — id is the only key attribute
+        print(f"[datastore] Creating table '{table_name}' in DynamoDB ({settings.AWS_REGION})...")
         await client.create_table(
             TableName=table_name,
             KeySchema=[{"AttributeName": "id", "KeyType": "HASH"}],
@@ -122,23 +199,21 @@ async def create_table_from_schema(table_name: str, schema: list) -> dict:
             BillingMode="PAY_PER_REQUEST",
         )
 
-        # Wait until ACTIVE
-        while True:
-            desc = await client.describe_table(TableName=table_name)
-            if desc["Table"]["TableStatus"] == "ACTIVE":
-                break
-            await asyncio.sleep(2)
+        # Wait up to 60 seconds for the table to become ACTIVE
+        await _wait_active(client, table_name, timeout_seconds=60)
+        print(f"[datastore] Table '{table_name}' is ACTIVE in DynamoDB.")
 
     return {"created": True, "table_name": table_name}
 
 
-# ── row insert ─────────────────────────────────────────────────
+# ── row insert ───────────────────────────────────────────────────
 
 async def insert_row(table_name: str, schema: list, row_data: dict) -> str:
     """
     Insert one row into a dynamic table.
     Each schema field becomes its own DynamoDB attribute (separate column).
     row_data keys must match field_id values in the schema.
+    Returns the generated record_id (UUID string).
     """
     db = get_dynamodb()
     tbl = await db.Table(table_name)
@@ -153,8 +228,8 @@ async def insert_row(table_name: str, schema: list, row_data: dict) -> str:
         field_type = field.get("type", "text")
         value      = row_data.get(field_id)
 
+        # Fall back to default from schema if caller didn't supply a value
         if value is None:
-            # Use default from schema if caller didn't supply a value
             value = field.get("value")
 
         casted = _cast(value, field_type)
@@ -165,7 +240,7 @@ async def insert_row(table_name: str, schema: list, row_data: dict) -> str:
     return record_id
 
 
-# ── row queries ────────────────────────────────────────────────
+# ── row queries ──────────────────────────────────────────────────
 
 async def list_rows(table_name: str) -> list[dict]:
     """Scan all rows from a dynamic table."""

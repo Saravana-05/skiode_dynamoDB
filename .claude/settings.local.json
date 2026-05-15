@@ -29,7 +29,12 @@
       "Bash(curl -s -X POST \"http://localhost:8003/datastore/my_employees/row\" -H \"Content-Type: application/json\" -d \"{\\\\\"employee_name\\\\\":\\\\\"Karthik\\\\\",\\\\\"employee_age\\\\\":28,\\\\\"employee_dept\\\\\":\\\\\"Engineering\\\\\",\\\\\"employee_salary\\\\\":72000,\\\\\"employee_region\\\\\":\\\\\"South\\\\\"}\")",
       "Bash(venv_new/Scripts/python.exe -m uvicorn app.main:app --host 0.0.0.0 --port 8004 --reload)",
       "Bash(curl -s -X POST \"http://localhost:8004/datastore/my_employees/row\" -H \"Content-Type: application/json\" -d \"{\\\\\"employee_name\\\\\":\\\\\"Karthik\\\\\",\\\\\"employee_age\\\\\":28,\\\\\"employee_dept\\\\\":\\\\\"Engineering\\\\\",\\\\\"employee_salary\\\\\":72000,\\\\\"employee_region\\\\\":\\\\\"South\\\\\"}\")",
-      "Bash(venv_new/Scripts/python.exe -c ' *)"
+      "Bash(venv_new/Scripts/python.exe -c ' *)",
+      "Bash(venv_new/Scripts/python.exe -m app.db.init_pg_tables)",
+      "Bash(docker --version)",
+      "Bash(psql --version)",
+      "Bash(pg_ctl --version)",
+      "Bash(pg_isready)"
     ]
   }
 }

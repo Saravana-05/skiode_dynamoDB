@@ -11,16 +11,22 @@ origins = [
     "http://localhost:3000",
     "http://127.0.0.1:3000",
     "http://localhost:5173",
+    "http://127.0.0.1:5173",
+    "http://localhost:5174",
     "http://192.168.0.107:5173",
     "http://192.168.0.107:5174",
+    "http://domainmodelconfig.s3-website-ap-southeast-2.amazonaws.com",
     "http://skiode-frontend.s3-website.ap-south-1.amazonaws.com",
+    # Lambda Function URL (self — needed when frontend calls this Lambda directly)
+    "https://bzpfusv4ugqui3ysdnx2j53iyy0kefvt.lambda-url.ap-south-1.on.aws",
 ]
 
 app.add_middleware(
     CORSMiddleware,
     allow_origins=origins,
-    allow_credentials=True,
-    allow_methods=["*"],
+    allow_origin_regex=r"https://.*\.on\.aws",   # any Lambda URL
+    allow_credentials=False,                      # must be False when allow_origins includes *
+    allow_methods=["GET", "POST", "PUT", "DELETE", "OPTIONS", "PATCH"],
     allow_headers=["*"],
 )
 

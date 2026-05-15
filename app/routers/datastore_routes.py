@@ -1,13 +1,18 @@
 """
-Dynamic Datastore API
+Dynamic Datastore API — backed by AWS DynamoDB
 
 Flow:
-  1. POST /datastore/create              → define schema + create DynamoDB table
+  1. POST /datastore/create              → define schema + create a real DynamoDB table
   2. POST /datastore/{table_name}/row    → insert a row — fields mapped from schema, stored as separate columns
   3. GET  /datastore/{table_name}/rows   → list all rows
   4. GET  /datastore/{table_name}/row/{id} → get one row
   5. GET  /datastore/schemas             → list all registered schemas
   6. GET  /datastore/schemas/{table_name} → get schema for one table
+
+Each call to POST /create:
+  - Creates a real AWS DynamoDB table (PAY_PER_REQUEST, id as PK)
+  - Saves the full schema JSON to the datastore_schemas meta-table
+  - The datastore_schemas meta-table is auto-created on first use
 """
 from typing import Any
 from fastapi import APIRouter, Body
@@ -49,31 +54,67 @@ class CreateTableRequest(BaseModel):
 
 # ── 1. Create table from schema ────────────────────────────────
 
-@router.post("/create", summary="Create a DynamoDB table from a JSON schema")
+@router.post("/create", summary="Create a database table from a JSON schema (DynamoDB or PostgreSQL)")
 async def create_table(body: CreateTableRequest):
     """
     Provide a table_name and a list of schema fields.
-    - Saves schema to datastore_schemas table
-    - Creates a real DynamoDB table (id as primary key)
-    - Each schema field will become its own separate column on row insert
+
+    Behaviour depends on DB_BACKEND setting:
+
+    DynamoDB:
+      - Creates a real AWS DynamoDB table (PAY_PER_REQUEST, id as HASH key)
+      - Waits until table status == ACTIVE
+      - If table already exists: schema metadata is updated, table left as-is
+
+    PostgreSQL:
+      - Runs CREATE TABLE with typed columns (VARCHAR / NUMERIC / BOOLEAN)
+      - If table already exists: runs ALTER TABLE ADD COLUMN for any new fields
+      - datastore_schemas meta-table is auto-created on first use
+
+    In both cases the schema JSON is saved to datastore_schemas.
     """
     try:
         from ..db.repositories.datastore_repo import create_table_from_schema, save_schema
+        from ..core.config import settings
 
         schema = [f.model_dump() for f in body.schema]
+        is_dynamo = settings.DB_BACKEND == "dynamodb"
+
+        # 1. Create / update the physical table
         result = await create_table_from_schema(body.table_name, schema)
+
+        # 2. Save / update schema metadata
         await save_schema(body.table_name, schema)
 
+        action = "created" if result["created"] else "already existed"
+
+        # Build backend-specific fields for the response
+        if is_dynamo:
+            backend_info = {"aws_region": settings.AWS_REGION}
+            location_str = f"in AWS DynamoDB region {settings.AWS_REGION}"
+        else:
+            backend_info = {"pg_host": settings.DB_HOST, "pg_db": settings.DB_NAME}
+            location_str = f"in PostgreSQL ({settings.DB_HOST}/{settings.DB_NAME})"
+
         return {
-            "status": "success",
-            "table_name": body.table_name,
+            "status":        "success",
+            "table_name":    body.table_name,
             "table_created": result["created"],
+            "action":        action,
+            "db_backend":    settings.DB_BACKEND,
+            **backend_info,
             "columns": [
                 {"field_id": f["field_id"], "label": f["label"], "type": f["type"]}
                 for f in schema
             ],
             "total_fields": len(schema),
+            "message": (
+                f"Table '{body.table_name}' {action} {location_str} "
+                f"with {len(schema)} field(s). Primary key: id."
+            ),
         }
+    except TimeoutError as e:
+        return {"status": "error", "message": f"Table creation timed out: {e}"}
     except Exception as e:
         return {"status": "error", "message": str(e)}
 
@@ -163,6 +204,24 @@ async def get_row(table_name: str, record_id: str):
         return {"status": "success", "table_name": table_name, "data": row}
     except Exception as e:
         return {"status": "error", "message": str(e)}
+
+
+# ── Config: get / switch active DB backend ────────────────────
+
+@router.get("/config", summary="Get the active DB backend")
+async def get_config():
+    from ..db.repositories.datastore_repo import get_backend
+    return {"status": "success", "db_backend": get_backend()}
+
+
+@router.post("/config", summary="Switch the active DB backend (dynamodb | postgresql)")
+async def update_config(body: dict[str, Any] = Body(...)):
+    backend = body.get("db_backend", "")
+    if backend not in ("dynamodb", "postgresql"):
+        return {"status": "error", "message": "db_backend must be 'dynamodb' or 'postgresql'"}
+    from ..db.repositories.datastore_repo import set_backend
+    set_backend(backend)
+    return {"status": "success", "db_backend": backend}
 
 
 # ── 5. List all schemas ────────────────────────────────────────
