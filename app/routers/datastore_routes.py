@@ -14,11 +14,88 @@ Each call to POST /create:
   - Saves the full schema JSON to the datastore_schemas meta-table
   - The datastore_schemas meta-table is auto-created on first use
 """
+import re
 from typing import Any
 from fastapi import APIRouter, Body
 from pydantic import BaseModel
 
 router = APIRouter(prefix="/datastore", tags=["Datastore - Dynamic Tables"])
+
+
+# ── Server-side field validator ────────────────────────────────
+
+def _validate_row(schema: list[dict], row_data: dict) -> dict[str, str]:
+    """
+    Validate row_data against the schema's validation rules.
+    Returns a dict of {field_id: error_message} for every failing field.
+    Empty dict means all fields are valid.
+    """
+    errors: dict[str, str] = {}
+
+    for field in schema:
+        fid   = field.get("field_id", "")
+        ftype = field.get("type", "text")
+        label = field.get("label") or fid
+        rules = field.get("validations") or []
+
+        raw = row_data.get(fid)
+        # Normalise to string for length/pattern checks
+        str_val = str(raw).strip() if raw is not None else ""
+
+        # ── built-in type checks ──────────────────────────────
+        if ftype == "number" and str_val != "":
+            try:
+                float(str_val)
+            except (ValueError, TypeError):
+                errors[fid] = f"{label} must be a valid number"
+                continue
+
+        # ── schema-defined rules ──────────────────────────────
+        for rule in rules:
+            rtype   = rule.get("type", "")
+            rvalue  = rule.get("value")
+            rmsg    = rule.get("message") or ""
+
+            if rtype == "required":
+                if str_val == "":
+                    errors[fid] = rmsg or f"{label} is required"
+                    break
+
+            elif rtype == "minLength":
+                if str_val and len(str_val) < int(rvalue):
+                    errors[fid] = rmsg or f"{label} must be at least {rvalue} characters"
+                    break
+
+            elif rtype == "maxLength":
+                if len(str_val) > int(rvalue):
+                    errors[fid] = rmsg or f"{label} must be at most {rvalue} characters"
+                    break
+
+            elif rtype == "min":
+                try:
+                    if str_val and float(str_val) < float(rvalue):
+                        errors[fid] = rmsg or f"{label} must be at least {rvalue}"
+                        break
+                except (ValueError, TypeError):
+                    pass
+
+            elif rtype == "max":
+                try:
+                    if str_val and float(str_val) > float(rvalue):
+                        errors[fid] = rmsg or f"{label} must be at most {rvalue}"
+                        break
+                except (ValueError, TypeError):
+                    pass
+
+            elif rtype == "pattern":
+                try:
+                    if str_val and not re.fullmatch(str(rvalue), str_val):
+                        errors[fid] = rmsg or f"{label} format is invalid"
+                        break
+                except re.error:
+                    pass  # ignore malformed regex
+
+    return errors
 
 
 # ── Pydantic models ────────────────────────────────────────────
@@ -150,6 +227,15 @@ async def insert_row(table_name: str, body: dict[str, Any] = Body(...)):
             return {
                 "status": "error",
                 "message": f"No schema found for table '{table_name}'. Create it first via POST /datastore/create"
+            }
+
+        # ── Server-side validation ────────────────────────────
+        validation_errors = _validate_row(schema, body)
+        if validation_errors:
+            return {
+                "status": "validation_error",
+                "message": "Validation failed",
+                "errors": validation_errors,   # {field_id: error_message}
             }
 
         # Show the mapping: schema field → input value → stored type
