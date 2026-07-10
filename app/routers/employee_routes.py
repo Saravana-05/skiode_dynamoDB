@@ -1,6 +1,8 @@
-from typing import Literal
+import re
+from typing import Any, Literal
 from fastapi import APIRouter, HTTPException
 from pydantic import BaseModel
+from ..utils.decorators import handle_errors   # ← add this import
 
 router = APIRouter(prefix="/employees", tags=["Employees"])
 
@@ -25,6 +27,7 @@ def _repo():
 
 
 @router.post("")
+@handle_errors                         # ← add
 async def add_employee(body: AddEmployeeRequest):
     repo = _repo()
     employee = await repo.create(name=body.name, skills=body.skills)
@@ -32,6 +35,7 @@ async def add_employee(body: AddEmployeeRequest):
 
 
 @router.get("")
+@handle_errors                         # ← add
 async def list_employees():
     repo = _repo()
     employees = await repo.list_all()
@@ -39,37 +43,26 @@ async def list_employees():
 
 
 @router.get("/filter/skill/{skill}")
+@handle_errors                         # ← add
 async def filter_by_skill(skill: str):
-    """Return all employees who have the given skill."""
     repo = _repo()
     employees = await repo.filter_by_skill(skill)
     return {"status": "success", "skill": skill, "count": len(employees), "data": employees}
 
 
 @router.get("/filter/skills-count")
+@handle_errors                         # ← add
 async def filter_by_skills_count(
     count: int,
     operator: Literal["eq", "gt", "lt", "gte", "lte"] = "eq",
 ):
-    """
-    Filter employees by number of skills.
-
-    - **count**: the number to compare against
-    - **operator**: eq | gt | lt | gte | lte  (default: eq)
-
-    Examples:
-    - `?count=1&operator=eq`  → employees with exactly 1 skill
-    - `?count=1&operator=gt`  → employees with more than 1 skill
-    """
     repo = _repo()
-    try:
-        employees = await repo.filter_by_skills_count(count=count, operator=operator)
-    except ValueError as e:
-        raise HTTPException(status_code=400, detail=str(e))
+    employees = await repo.filter_by_skills_count(count=count, operator=operator)
     return {"status": "success", "filter": f"skills_count {operator} {count}", "count": len(employees), "data": employees}
 
 
 @router.get("/{employee_id}")
+@handle_errors                         # ← add
 async def get_employee(employee_id: str):
     repo = _repo()
     employee = await repo.get_by_id(employee_id)

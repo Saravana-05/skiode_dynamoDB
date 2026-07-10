@@ -249,6 +249,11 @@ async def list_rows(table_name: str) -> list[dict]:
     resp = await tbl.scan()
     return [clean(i) for i in resp.get("Items", [])]
 
+async def list_archived_rows(table_name: str) -> list[dict]:
+    rows = await fetch(
+        f'SELECT * FROM "{table_name}" WHERE deleted_at IS NOT NULL ORDER BY deleted_at DESC'
+    )
+    return [dict(r) for r in rows]
 
 async def get_row(table_name: str, record_id: str) -> dict | None:
     """Get one row by id."""

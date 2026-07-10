@@ -1,9 +1,23 @@
-from fastapi import FastAPI
+import logging
+from fastapi import FastAPI, Request
 from fastapi.middleware.cors import CORSMiddleware
+from fastapi.responses import JSONResponse
 from .core.config import settings
+from .middleware.audit_log_middleware import AuditLogMiddleware
 from .routers import calendar_account_routes, calendar_event_routes, oauth_routes, \
-    organization_routes, auth_routes, test_routes, employee_routes, datastore_routes
+    organization_routes, auth_routes, test_routes, employee_routes, datastore_routes, \
+    audit_routes, query_builder_routes
 from mangum import Mangum
+
+# ── Audit log setup ─────────────────────────────────────────────
+logging.basicConfig(
+    level=logging.INFO,
+    format="%(message)s",
+    handlers=[
+        logging.StreamHandler(),                     # prints to terminal
+        logging.FileHandler("audit.log", mode="a"),  # saves to file
+    ]
+)
 
 app = FastAPI(title="skiode")
 
@@ -29,6 +43,17 @@ app.add_middleware(
     allow_methods=["GET", "POST", "PUT", "DELETE", "OPTIONS", "PATCH"],
     allow_headers=["*"],
 )
+
+app.add_middleware(AuditLogMiddleware)
+
+
+@app.exception_handler(Exception)
+async def unhandled_exception_handler(request: Request, exc: Exception):
+    request_id = getattr(request.state, "request_id", None)
+    return JSONResponse(
+        status_code=500,
+        content={"detail": "Internal server error", "request_id": request_id},
+    )
 
 
 @app.on_event("startup")
@@ -60,6 +85,8 @@ app.include_router(auth_routes.router)
 app.include_router(test_routes.router)
 app.include_router(employee_routes.router)
 app.include_router(datastore_routes.router)
+app.include_router(audit_routes.router)
+app.include_router(query_builder_routes.router)
 
 
 @app.get("/")

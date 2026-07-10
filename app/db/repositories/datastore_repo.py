@@ -46,8 +46,52 @@ async def list_rows(table_name: str) -> list[dict]:
     return await _repo().list_rows(table_name)
 
 
+async def list_archived_rows(table_name: str) -> list[dict]:
+    return await _repo().list_archived_rows(table_name)
+
+
 async def get_row(table_name: str, record_id: str) -> dict | None:
     return await _repo().get_row(table_name, record_id)
+
+
+async def update_row(table_name: str, record_id: str, row_data: dict) -> dict:
+    return await _repo().update_row(table_name, record_id, row_data)
+
+
+async def delete_row(table_name: str, record_id: str) -> dict:
+    return await _repo().delete_row(table_name, record_id)
+
+
+async def save_domain_attribute(
+    domain_model_id: str,
+    attribute_name: str,
+    label: str | None = None,
+    field_type: str | None = None,
+) -> dict:
+    return await _repo().save_domain_attribute(
+        domain_model_id, attribute_name, label, field_type
+    )
+
+
+async def list_domain_attributes(domain_model_id: str) -> list[dict]:
+    return await _repo().list_domain_attributes(domain_model_id)
+
+
+# ── Translation helpers — linked table (attribute_translations) ───────
+
+async def save_attribute_translation(
+    domain_model_id: str,
+    attribute_name: str,
+    lang_code: str,
+    label: str,
+) -> dict:
+    return await _repo().save_attribute_translation(
+        domain_model_id, attribute_name, lang_code, label
+    )
+
+
+async def get_domain_translations(domain_model_id: str) -> dict:
+    return await _repo().get_domain_translations(domain_model_id)
 
 
 __all__ = [
@@ -59,5 +103,12 @@ __all__ = [
     "create_table_from_schema",
     "insert_row",
     "list_rows",
+    "list_archived_rows",
     "get_row",
+    "update_row",
+    "delete_row",
+    "save_domain_attribute",
+    "list_domain_attributes",
+    "save_attribute_translation",
+    "get_domain_translations",
 ]
