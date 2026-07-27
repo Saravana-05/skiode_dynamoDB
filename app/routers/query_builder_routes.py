@@ -20,6 +20,8 @@ from pydantic import BaseModel
 from ..utils.decorators import handle_errors
 from ..core.config import settings
 
+from ..db.repositories.postgres.relationship_repo import get_query_definition, run_select
+
 router = APIRouter(prefix="/query-builder", tags=["Query Builder - Relational Queries"])
 
 
@@ -284,3 +286,33 @@ async def get_domain_objects(request: Request):
     from ..db.repositories.postgres.relationship_repo import list_domain_objects
     rows = await list_domain_objects()
     return {"status": "success", "data": rows}
+
+
+# Mohan Dev Begins ---->
+@router.post("/definitions/{query_definition_id}/execute", summary="Execute an existing saved query")
+@handle_errors
+async def execute_saved_query(query_definition_id: int, request: Request):
+    """
+    Execute query for data provider
+    """
+    definition = await get_query_definition(query_definition_id)
+    if not definition:
+        raise HTTPException(status_code=404, detail="Query definition not found")
+
+    query_json = definition["query_json"]
+    sql_text, params = await _resolve_and_generate(query_json)
+
+    try:
+        rows = await run_select(sql_text, params)
+    except Exception as e:
+        raise HTTPException(status_code=400,detail=f"Query execution failed: {e}")
+
+    return {
+        "status": "success",
+        "query_definition_id": query_definition_id,
+        "row_count": len(rows),
+        "data": rows
+    }
+
+# Mohan Dev Ends ---->
+0

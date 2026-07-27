@@ -1,0 +1,27 @@
+[user_interaction]
+get_all_user_interactions = """
+SELECT * FROM user_interaction WHERE is_active = TRUE ORDER BY updated_at DESC
+"""
+
+get_user_interaction_by_id = """
+SELECT * FROM user_interaction WHERE id = $1 AND is_active = TRUE
+"""
+
+insert_user_interaction = """
+INSERT INTO user_interaction (page_name, page_data, created_by)
+VALUES ($1, $2, $3)
+RETURNING *
+"""
+
+update_user_interaction = """
+UPDATE user_interaction
+SET page_data = $2, updated_at = NOW()
+WHERE id = $1
+RETURNING *
+"""
+
+soft_delete_user_interaction = """
+UPDATE user_interaction
+SET is_active = FALSE, updated_at = NOW()
+WHERE id = $1
+"""

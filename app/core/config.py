@@ -70,13 +70,20 @@ class Settings(BaseSettings):
     # Site url (used in send mail)
     SITE_URL: Optional[str] = None
 
+    # class Config:
+    #     # Primary: app/.env (where the file actually lives)
+    #     # Fallback: project root .env
+    #     env_file = [
+    #         os.path.join(os.path.dirname(os.path.dirname(os.path.dirname(__file__))), ".env"),  # fastapi_service/.env
+    #         os.path.join(BASE_DIR, ".env"),                                                       # project root .env
+    #     ]
+    #     env_file_encoding = "utf-8"
+    #     extra = "ignore"
     class Config:
-        # Primary: app/.env (where the file actually lives)
-        # Fallback: project root .env
-        env_file = [
-            os.path.join(os.path.dirname(os.path.dirname(os.path.dirname(__file__))), ".env"),  # fastapi_service/.env
-            os.path.join(BASE_DIR, ".env"),                                                       # project root .env
-        ]
+        env_file = os.path.join(
+            os.path.dirname(os.path.dirname(__file__)),
+            ".env"
+        )
         env_file_encoding = "utf-8"
         extra = "ignore"
 
