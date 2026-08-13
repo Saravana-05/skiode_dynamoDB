@@ -1,0 +1,30 @@
+[grid_layout]
+get_all_grid_layouts = """
+SELECT * FROM grid_layout ORDER BY updated_at DESC
+"""
+
+get_grid_layouts_by_page_name = """
+SELECT * FROM grid_layout WHERE page_name = $1 ORDER BY updated_at DESC
+"""
+
+get_grid_layout_by_id = """
+SELECT * FROM grid_layout WHERE id = $1
+"""
+
+insert_grid_layout = """
+INSERT INTO grid_layout (page_name, label, layout_data, created_by)
+VALUES ($1, $2, $3, $4)
+RETURNING *
+"""
+
+update_grid_layout = """
+UPDATE grid_layout
+SET layout_data = $2, label = $3, updated_at = NOW()
+WHERE id = $1
+RETURNING *
+"""
+
+delete_grid_layout = """
+DELETE FROM grid_layout
+WHERE id = $1
+"""

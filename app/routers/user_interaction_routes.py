@@ -13,11 +13,13 @@ user_interaction_service = UserInteractionService()
 class CreatePageRequest(BaseModel):
     page_name: str
     page_data: Dict[str, Any]
+    label: Optional[str] = "Untitled Page"
     created_by: Optional[str] = None
 
 
 class UpdatePageRequest(BaseModel):
     page_data: Dict[str, Any]
+    label: Optional[str] = "Untitled Page"
 
 
 @router.post("/")

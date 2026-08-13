@@ -6,7 +6,7 @@ from .core.config import settings
 from .middleware.audit_log_middleware import AuditLogMiddleware
 from .routers import calendar_account_routes, calendar_event_routes, oauth_routes, \
     organization_routes, auth_routes, test_routes, employee_routes, datastore_routes, \
-    audit_routes, query_builder_routes, user_interaction_routes
+    audit_routes, query_builder_routes, user_interaction_routes, grid_layout_routes
 from mangum import Mangum
 
 # ── Audit log setup ─────────────────────────────────────────────
@@ -88,6 +88,7 @@ app.include_router(datastore_routes.router)
 app.include_router(audit_routes.router)
 app.include_router(query_builder_routes.router)
 app.include_router(user_interaction_routes.router)
+app.include_router(grid_layout_routes.router)
 
 
 @app.get("/")

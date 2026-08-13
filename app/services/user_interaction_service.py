@@ -35,6 +35,7 @@ class UserInteractionService:
             data.get("page_name", ""),
             to_jsonb(data.get("page_data")),
             data.get("created_by", ""),
+            data.get("label") or "Untitled Page",
         )
         result = dict(row)
         result["page_data"] = from_jsonb(result.get("page_data"))
@@ -45,6 +46,7 @@ class UserInteractionService:
             ui_q["update_user_interaction"],
             interaction_id,
             to_jsonb(data.get("page_data")),
+            data.get("label") or "Untitled Page",
         )
         if not row:
             return None

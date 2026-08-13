@@ -7,7 +7,8 @@ from typing import Callable, Optional, Union
 from fastapi import Request, Response
 from fastapi.responses import JSONResponse
 from starlette.middleware.base import BaseHTTPMiddleware
-from jose import jwt, JWTError
+from jose import jwt
+from jose.exceptions import JOSEError  # base class for JWTError, JWKError, JWSError, etc.
 
 from ..core.config import settings
 
@@ -29,7 +30,13 @@ def _extract_user_id(request: Request) -> Optional[Union[int, str]]:
             options={"verify_exp": False},
         )
         return payload.get("user_id")
-    except JWTError:
+    except JOSEError:
+        # Covers JWTError, JWKError, JWSError, ExpiredSignatureError, etc.
+        # A bad/missing/malformed token should never crash the middleware.
+        return None
+    except Exception:
+        # Belt-and-suspenders: this is best-effort auditing, never let it
+        # take the whole request down.
         return None
 
 

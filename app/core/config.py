@@ -70,22 +70,39 @@ class Settings(BaseSettings):
     # Site url (used in send mail)
     SITE_URL: Optional[str] = None
 
-    # class Config:
-    #     # Primary: app/.env (where the file actually lives)
-    #     # Fallback: project root .env
-    #     env_file = [
-    #         os.path.join(os.path.dirname(os.path.dirname(os.path.dirname(__file__))), ".env"),  # fastapi_service/.env
-    #         os.path.join(BASE_DIR, ".env"),                                                       # project root .env
-    #     ]
-    #     env_file_encoding = "utf-8"
-    #     extra = "ignore"
     class Config:
-        env_file = os.path.join(
-            os.path.dirname(os.path.dirname(__file__)),
-            ".env"
-        )
+        # Check several likely locations for .env so this works regardless
+        # of exactly where the file was placed. pydantic-settings loads
+        # every path in this list that actually exists; later entries
+        # override earlier ones on key collisions.
+        env_file = [
+            os.path.join(os.path.dirname(os.path.dirname(__file__)), ".env"),                    # app/.env
+            os.path.join(os.path.dirname(os.path.dirname(os.path.dirname(__file__))), ".env"),    # fastapi_service/.env
+            os.path.join(BASE_DIR, ".env"),                                                       # project root .env
+        ]
         env_file_encoding = "utf-8"
         extra = "ignore"
 
 
 settings = Settings()
+
+# Fail loudly instead of silently falling back to None / OS defaults.
+# This is exactly what caused `database 'None'` and
+# `password authentication failed for user "DELL"` previously — the
+# settings loaded with every DB_* field at its None default because no
+# .env file was found on the old single-path lookup.
+if settings.DB_BACKEND == "postgresql":
+    _missing = [
+        name for name, val in [
+            ("DB_HOST", settings.DB_HOST),
+            ("DB_USER", settings.DB_USER),
+            ("DB_PASSWORD", settings.DB_PASSWORD),
+            ("DB_NAME", settings.DB_NAME),
+        ]
+        if not val
+    ]
+    if _missing:
+        print(
+            f"[config] WARNING: DB_BACKEND=postgresql but missing env vars: {_missing}. "
+            f"Checked .env locations: {Settings.Config.env_file}"
+        )
