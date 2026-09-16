@@ -62,3 +62,8 @@ Thumbs.db
 
 # Migrations
 migrations/.env 
+
+
+certs/
+aws_db_credents.txt
+domain_model_user_coackroach_db_pw.txt
