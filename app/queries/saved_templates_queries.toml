@@ -1,0 +1,19 @@
+[saved_templates]
+get_all_saved_templates = """
+SELECT * FROM saved_templates ORDER BY updated_at DESC
+"""
+
+get_saved_template_by_id = """
+SELECT * FROM saved_templates WHERE id = $1
+"""
+
+insert_saved_template = """
+INSERT INTO saved_templates (name, plugin_id, instance, created_by)
+VALUES ($1, $2, $3, $4)
+RETURNING *
+"""
+
+delete_saved_template = """
+DELETE FROM saved_templates
+WHERE id = $1
+"""

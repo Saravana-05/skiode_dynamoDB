@@ -1,4 +1,5 @@
 import logging
+import os
 from fastapi import FastAPI, Request
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse
@@ -6,20 +7,29 @@ from .core.config import settings
 from .middleware.audit_log_middleware import AuditLogMiddleware
 from .routers import calendar_account_routes, calendar_event_routes, oauth_routes, \
     organization_routes, auth_routes, test_routes, employee_routes, datastore_routes, \
-    audit_routes, query_builder_routes, user_interaction_routes, grid_layout_routes
+    audit_routes, query_builder_routes, user_interaction_routes, grid_layout_routes, \
+    saved_templates_routes, project_routes
 from mangum import Mangum
 
 # ── Audit log setup ─────────────────────────────────────────────
+# Lambda's filesystem is read-only except /tmp, so the log file path
+# must switch based on environment or the app crashes on cold start.
+_is_lambda = os.environ.get("AWS_LAMBDA_FUNCTION_NAME") is not None
+_log_file_path = "/tmp/audit.log" if _is_lambda else "audit.log"
+
 logging.basicConfig(
     level=logging.INFO,
     format="%(message)s",
     handlers=[
-        logging.StreamHandler(),                     # prints to terminal
-        logging.FileHandler("audit.log", mode="a"),  # saves to file
+        logging.StreamHandler(),                          # prints to terminal / CloudWatch
+        logging.FileHandler(_log_file_path, mode="a"),     # local file, or /tmp in Lambda
     ]
 )
 
-app = FastAPI(title="skiode")
+app = FastAPI(
+    title="skiode",
+    redirect_slashes=False,  # required for Lambda — avoids 307 redirect loops
+)
 
 origins = [
     "http://localhost:3000",
@@ -27,6 +37,8 @@ origins = [
     "http://localhost:5173",
     "http://127.0.0.1:5173",
     "http://localhost:5174",
+    "http://82.29.164.12:3000",
+    "http://82.29.164.12:3001",
     "http://192.168.0.107:5173",
     "http://192.168.0.107:5174",
     "http://domainmodelconfig.s3-website-ap-southeast-2.amazonaws.com",
@@ -89,6 +101,8 @@ app.include_router(audit_routes.router)
 app.include_router(query_builder_routes.router)
 app.include_router(user_interaction_routes.router)
 app.include_router(grid_layout_routes.router)
+app.include_router(saved_templates_routes.router)
+app.include_router(project_routes.router)
 
 
 @app.get("/")

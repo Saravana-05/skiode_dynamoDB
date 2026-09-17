@@ -1,0 +1,10 @@
+FROM public.ecr.aws/lambda/python:3.12
+
+COPY requirements.txt .
+RUN pip install -r requirements.txt
+
+COPY . .
+
+# app/main.py defines `handler = Mangum(app)` directly,
+# so no separate lambda_handler.py is needed.
+CMD ["app.main.handler"]

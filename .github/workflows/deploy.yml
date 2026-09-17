@@ -1,0 +1,42 @@
+name: Build and Deploy Backend
+
+on:
+  push:
+    branches:
+      - keerthana-dev
+
+jobs:
+  deploy:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Deploy to Server
+        uses: appleboy/ssh-action@v1.2.2
+        with:
+          host: ${{ secrets.SERVER_IP }}
+          username: ${{ secrets.SERVER_USER }}
+          password: ${{ secrets.SERVER_PASSWORD }}
+          script: |
+            REPO_DIR=/home/dev/repos/skiode-backend
+            ENV_FILE=/home/dev/skiode_dynamoDB/.env
+            CERT_FILE=/home/dev/skiode_dynamoDB/certs/root.crt
+
+            if [ ! -d "$REPO_DIR" ]; then
+              git clone https://github.com/Saravana-05/skiode_dynamoDB.git "$REPO_DIR"
+            fi
+
+            cd "$REPO_DIR"
+            git fetch origin
+            git checkout keerthana-dev
+            git pull origin keerthana-dev
+
+            docker build -t skiode-backend .
+            docker rm -f skiode-backend || true
+            docker run -d \
+              --name skiode-backend \
+              -p 8080:8000 \
+              --env-file "$ENV_FILE" \
+              -v "$CERT_FILE:/certs/root.crt:ro" \
+              --restart unless-stopped \
+              skiode-backend
+
+            docker image prune -f

@@ -27,6 +27,23 @@ _PG_TYPE = {
 }
 
 
+def _stringify_id(row: dict) -> dict:
+    """
+    `id` columns here hold values well beyond JavaScript's safe integer
+    range (Number.MAX_SAFE_INTEGER ≈ 9×10^15, ~16 digits) — these ids run
+    to 19 digits. Returned as a bare JSON number, the browser's JSON.parse
+    silently rounds it during parsing, before any frontend code even sees
+    it. That corrupted id is then sent back on update/delete calls, matches
+    zero rows in Postgres, and the call still reports "success" — looking
+    exactly like a successful no-op. Stringifying `id` here (matching how
+    insert_row/update_row/delete_row already return record_id as a string)
+    keeps the exact value intact end to end.
+    """
+    if row.get("id") is not None:
+        row["id"] = str(row["id"])
+    return row
+
+
 # ── auto-create the datastore_schemas meta-table ────────────────
 
 _schemas_table_ready = False   # module-level flag, checked once per process
@@ -45,50 +62,73 @@ async def _ensure_datastore_schemas_table() -> None:
         )
         """
     )
+    # Backfill: project_id is nullable so pre-existing domain models
+    # (created before Projects existed) stay valid and global/unassigned —
+    # they just never get a project_id set.
+    await execute(
+        "ALTER TABLE datastore_schemas ADD COLUMN IF NOT EXISTS project_id INTEGER"
+    )
     print("[datastore] Meta-table 'datastore_schemas' ready (PostgreSQL).")
     _schemas_table_ready = True
 
 
 # ── schema meta-table helpers ────────────────────────────────────
 
-async def save_schema(table_name: str, schema: list) -> None:
+async def save_schema(table_name: str, schema: list, project_id: int | str | None = None) -> None:
     await _ensure_datastore_schemas_table()
     now = datetime.now(timezone.utc).isoformat()
+    # Note: project_id is only ever SET on INSERT or when a value is
+    # explicitly passed in — a plain re-save (e.g. adding a field to an
+    # existing domain model, project_id=None) must not silently detach
+    # the domain model from the project it already belongs to.
     await execute(
         """
-        INSERT INTO datastore_schemas (table_name, schema, created_at)
-        VALUES ($1, $2, $3)
+        INSERT INTO datastore_schemas (table_name, schema, created_at, project_id)
+        VALUES ($1, $2, $3, $4)
         ON CONFLICT (table_name) DO UPDATE
-            SET schema = EXCLUDED.schema, created_at = EXCLUDED.created_at
+            SET schema = EXCLUDED.schema,
+                created_at = EXCLUDED.created_at,
+                project_id = COALESCE(EXCLUDED.project_id, datastore_schemas.project_id)
         """,
         table_name, json.dumps(schema), now,
+        int(project_id) if project_id is not None else None,
     )
 
 
 async def get_schema(table_name: str) -> dict | None:
     await _ensure_datastore_schemas_table()
     row = await fetchrow(
-        "SELECT schema FROM datastore_schemas WHERE table_name = $1", table_name
+        "SELECT schema, project_id FROM datastore_schemas WHERE table_name = $1", table_name
     )
     if not row:
         return None
     return {
         "schema":     json.loads(row["schema"]),
         "db_backend": "postgresql",
+        "project_id": str(row["project_id"]) if row["project_id"] is not None else None,
     }
 
 
-async def list_schemas() -> list[dict]:
+async def list_schemas(project_id: int | str | None = None) -> list[dict]:
     await _ensure_datastore_schemas_table()
-    rows = await fetch(
-        "SELECT table_name, schema, created_at FROM datastore_schemas ORDER BY created_at DESC"
-    )
+    if project_id is not None:
+        rows = await fetch(
+            "SELECT table_name, schema, created_at, project_id FROM datastore_schemas "
+            "WHERE project_id = $1 ORDER BY created_at DESC",
+            int(project_id),
+        )
+    else:
+        rows = await fetch(
+            "SELECT table_name, schema, created_at, project_id FROM datastore_schemas "
+            "ORDER BY created_at DESC"
+        )
     return [
         {
             "table_name": r["table_name"],
             "schema":     json.loads(r["schema"]),
             "created_at": str(r["created_at"]) if r["created_at"] else None,
             "db_backend": "postgresql",
+            "project_id": str(r["project_id"]) if r["project_id"] is not None else None,
         }
         for r in rows
     ]
@@ -224,17 +264,17 @@ async def list_rows(table_name: str, include_deleted: bool = False) -> list[dict
         rows = await fetch(f'SELECT * FROM "{table_name}" ORDER BY created_at DESC')
     else:
         rows = await fetch(f'SELECT * FROM "{table_name}" WHERE deleted_at IS NULL ORDER BY created_at DESC')
-    return [dict(r) for r in rows]
+    return [_stringify_id(dict(r)) for r in rows]
 
 async def list_archived_rows(table_name: str) -> list[dict]:
     rows = await fetch(
         f'SELECT * FROM "{table_name}" WHERE deleted_at IS NOT NULL ORDER BY deleted_at DESC'
     )
-    return [dict(r) for r in rows]
+    return [_stringify_id(dict(r)) for r in rows]
 
 async def get_row(table_name: str, record_id: str) -> dict | None:
     row = await fetchrow(f'SELECT * FROM "{table_name}" WHERE id = $1', int(record_id))
-    return dict(row) if row else None
+    return _stringify_id(dict(row)) if row else None
 
 
 # ── row update ──────────────────────────────────────────────────
@@ -596,3 +636,167 @@ async def get_domain_translations(domain_model_id: str) -> dict:
     except Exception as e:
         print(f"[datastore] WARNING: Could not load translations: {e}")
         return {}
+
+# ════════════════════════════════════════════════════════════════════════
+# validation_rules — named, reusable validation rule registry
+# Backs the "Create new rule" flow in the Schema Inspector's field builder
+# (Validations tab / Registry Rules picker). Supports both authoring
+# shapes the frontend already knows about, side by side on the same row:
+#   - legacy flat shape:  { type, value, message }
+#   - new kind-based shape: { kind, expression, min, max, validations }
+# A row uses one or the other — never both — same as the frontend's
+# NamedValidationRule type (see src/core/schema/types.ts).
+# ════════════════════════════════════════════════════════════════════════
+
+_validation_rules_table_ready = False   # module-level flag, checked once per process
+
+
+async def _ensure_validation_rules_table() -> None:
+    global _validation_rules_table_ready
+    if _validation_rules_table_ready:
+        return
+    await execute(
+        """
+        CREATE TABLE IF NOT EXISTS validation_rules (
+            tag             VARCHAR PRIMARY KEY,
+            version         VARCHAR,
+            description     TEXT,
+            category        VARCHAR NOT NULL DEFAULT 'common',
+
+            kind            VARCHAR,
+            expression      TEXT,
+            min_value       NUMERIC,
+            max_value       NUMERIC,
+            validations     TEXT,
+
+            legacy_type     VARCHAR,
+            legacy_value    TEXT,
+            legacy_message  TEXT,
+
+            created_at      VARCHAR,
+            updated_at      VARCHAR
+        )
+        """
+    )
+    await execute(
+        """
+        CREATE INDEX IF NOT EXISTS idx_validation_rules_category
+        ON validation_rules (category)
+        """
+    )
+    print("[datastore] Meta-table 'validation_rules' ready (PostgreSQL).")
+    _validation_rules_table_ready = True
+
+
+def _validation_rule_row_to_wire(r: dict) -> dict:
+    """
+    DB row -> exactly the JSON shape the frontend's NamedValidationRule
+    expects — drops whichever shape's columns are unused (kind-based vs
+    legacy) instead of returning nulls for every column on every rule.
+    """
+    out: dict = {
+        "tag":         r["tag"],
+        "version":     r["version"],
+        "description": r["description"],
+        "category":    r["category"],
+    }
+    if r["kind"]:
+        out["kind"] = r["kind"]
+        if r["expression"] is not None:
+            out["expression"] = r["expression"]
+        if r["min_value"] is not None:
+            out["min"] = float(r["min_value"])
+        if r["max_value"] is not None:
+            out["max"] = float(r["max_value"])
+        if r["validations"] is not None:
+            out["validations"] = json.loads(r["validations"])
+    if r["legacy_type"]:
+        out["type"] = r["legacy_type"]
+        if r["legacy_value"] is not None:
+            out["value"] = json.loads(r["legacy_value"])
+        if r["legacy_message"] is not None:
+            out["message"] = r["legacy_message"]
+    return out
+
+
+async def list_validation_rules() -> list[dict]:
+    try:
+        await _ensure_validation_rules_table()
+        rows = await fetch(
+            "SELECT * FROM validation_rules ORDER BY category, tag"
+        )
+        return [_validation_rule_row_to_wire(dict(r)) for r in rows]
+    except Exception as e:
+        print(f"[datastore] WARNING: Could not list validation rules: {e}")
+        return []
+async def delete_validation_rule(tag: str) -> dict:
+    """
+    Deletes one validation rule by tag. Safe to call on a tag that's
+    already gone or never existed — returns success either way, since
+    the end state (row absent) is what the caller actually wants.
+    """
+    try:
+        await _ensure_validation_rules_table()
+        await execute("DELETE FROM validation_rules WHERE tag = $1", tag)
+        print(f"[datastore] Validation rule '{tag}' deleted.")
+        return {"status": "success", "tag": tag}
+    except Exception as e:
+        print(f"[datastore] WARNING: Could not delete validation rule '{tag}': {e}")
+        return {"status": "error", "message": str(e)}
+
+async def save_validation_rule(tag: str, rule: dict) -> dict:
+    """
+    Upserts one validation rule, keyed by tag. `rule` is the raw dict sent
+    by the frontend (see apiSaveValidationRule in datastoreApi.ts) — may
+    contain either the kind-based fields or the legacy flat fields, never
+    both.
+    """
+    try:
+        await _ensure_validation_rules_table()
+        now = datetime.now(timezone.utc)
+
+        validations = rule.get("validations")
+        value = rule.get("value")
+
+        await execute(
+            """
+            INSERT INTO validation_rules (
+                tag, version, description, category,
+                kind, expression, min_value, max_value, validations,
+                legacy_type, legacy_value, legacy_message,
+                created_at, updated_at
+            )
+            VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $13)
+            ON CONFLICT (tag) DO UPDATE
+                SET version        = EXCLUDED.version,
+                    description    = EXCLUDED.description,
+                    category       = EXCLUDED.category,
+                    kind           = EXCLUDED.kind,
+                    expression     = EXCLUDED.expression,
+                    min_value      = EXCLUDED.min_value,
+                    max_value      = EXCLUDED.max_value,
+                    validations    = EXCLUDED.validations,
+                    legacy_type    = EXCLUDED.legacy_type,
+                    legacy_value   = EXCLUDED.legacy_value,
+                    legacy_message = EXCLUDED.legacy_message,
+                    updated_at     = EXCLUDED.updated_at
+            """,
+            tag,
+            rule.get("version"),
+            rule.get("description"),
+            rule.get("category") or "common",
+            rule.get("kind"),
+            rule.get("expression"),
+            rule.get("min"),
+            rule.get("max"),
+            json.dumps(validations) if validations is not None else None,
+            rule.get("type"),
+            json.dumps(value) if value is not None else None,
+            rule.get("message"),
+            now,
+        )
+        print(f"[datastore] Validation rule '{tag}' saved.")
+        return {"status": "success"}
+    except Exception as e:
+        print(f"[datastore] WARNING: Could not save validation rule '{tag}': {e}")
+        return {"status": "error", "message": str(e)}

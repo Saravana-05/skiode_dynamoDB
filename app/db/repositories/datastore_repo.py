@@ -22,16 +22,22 @@ def _repo():
     return r
 
 
-async def save_schema(table_name: str, schema: list) -> None:
-    return await _repo().save_schema(table_name, schema)
+async def save_schema(table_name: str, schema: list, project_id: int | str | None = None) -> None:
+    # project_id (Projects feature) is currently PostgreSQL-only.
+    if _backend == "dynamodb":
+        return await _repo().save_schema(table_name, schema)
+    return await _repo().save_schema(table_name, schema, project_id)
 
 
 async def get_schema(table_name: str) -> list | None:
     return await _repo().get_schema(table_name)
 
 
-async def list_schemas() -> list[dict]:
-    return await _repo().list_schemas()
+async def list_schemas(project_id: int | str | None = None) -> list[dict]:
+    # project_id (Projects feature) is currently PostgreSQL-only.
+    if _backend == "dynamodb":
+        return await _repo().list_schemas()
+    return await _repo().list_schemas(project_id)
 
 
 async def create_table_from_schema(table_name: str, schema: list) -> dict:
@@ -94,6 +100,25 @@ async def get_domain_translations(domain_model_id: str) -> dict:
     return await _repo().get_domain_translations(domain_model_id)
 
 
+# ── validation_rules — registry/config data, always PostgreSQL ─────────
+# Not part of the dynamodb/postgresql switch above: these are named
+# validation rules (the Schema Inspector's "Create new rule" flow), not
+# per-domain dynamic table data, so they always go straight to the
+# PostgreSQL implementation regardless of the active _backend setting —
+# there's no dynamo equivalent (mirrors how attribute_translations was
+# also only ever added to the postgres repo, not the dynamo one).
+
+async def list_validation_rules() -> list[dict]:
+    from .postgres.datastore_repo import list_validation_rules as _list
+    return await _list()
+
+
+async def save_validation_rule(tag: str, rule: dict) -> dict:
+    from .postgres.datastore_repo import save_validation_rule as _save
+    return await _save(tag, rule)
+
+
+
 __all__ = [
     "get_backend",
     "set_backend",
@@ -111,4 +136,6 @@ __all__ = [
     "list_domain_attributes",
     "save_attribute_translation",
     "get_domain_translations",
+    "list_validation_rules",
+    "save_validation_rule",
 ]

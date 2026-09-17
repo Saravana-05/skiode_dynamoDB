@@ -14,6 +14,14 @@ Each call to POST /create:
   - If table already exists: schema metadata is updated, table left as-is
   - The datastore_schemas meta-table is auto-created on first use
 
+Projects (PostgreSQL only):
+  POST /datastore/create accepts an optional `project_id` to scope the
+  new domain model to a project (see /projects routes). Physical table
+  names are still globally unique in Postgres, so `project_id` is a
+  grouping/ownership tag, not a namespace for the table name itself.
+  GET /datastore/schemas?project_id=... lists only that project's
+  domain models; omit it to list everything (unchanged, backward compatible).
+
 Domain attributes + multilingual labels:
   10. POST /datastore/domain-attributes                                    → save an attribute's English label
   11. GET  /datastore/domain-attributes/{domain_model_id}                  → list attributes for a domain
@@ -120,6 +128,7 @@ class SchemaField(BaseModel):
 class CreateTableRequest(BaseModel):
     table_name: str
     schema: list[SchemaField]
+    project_id: str | int | None = None   # optional — scopes this domain model to a project
 
     model_config = {
         "json_schema_extra": {
@@ -147,6 +156,25 @@ class DomainAttributeRequest(BaseModel):
 class AttributeTranslationRequest(BaseModel):
     lang_code: str   # 'en' | 'ta' | 'ar'
     label: str
+
+
+class ValidationRuleRequest(BaseModel):
+    tag: str
+    version: str | None = None
+    description: str | None = None
+    category: str | None = None
+
+    # new kind-based shape
+    kind: str | None = None
+    expression: str | None = None
+    min: float | None = None
+    max: float | None = None
+    validations: list[Any] | None = None
+
+    # legacy flat shape
+    type: str | None = None
+    value: Any = None
+    message: str | None = None
 
 
 # ── Helper: safely extract schema list from repo result ────────
@@ -188,7 +216,7 @@ async def create_table(body: CreateTableRequest, request: Request):
     result = await create_table_from_schema(body.table_name, schema)
 
     # 2. Save / update schema metadata
-    await save_schema(body.table_name, schema)
+    await save_schema(body.table_name, schema, body.project_id)
 
     action = "created" if result["created"] else "already existed"
 
@@ -206,6 +234,7 @@ async def create_table(body: CreateTableRequest, request: Request):
         "table_created": result["created"],
         "action":        action,
         "db_backend":    settings.DB_BACKEND,
+        "project_id":    body.project_id,
         **backend_info,
         "columns": [
             {"field_id": f["field_id"], "label": f["label"], "type": f["type"]}
@@ -321,12 +350,12 @@ async def update_config(request: Request, body: dict[str, Any] = Body(...)):
 
 # ── 5. List all schemas ────────────────────────────────────────
 
-@router.get("/schemas", summary="List all registered schemas")
+@router.get("/schemas", summary="List all registered schemas (optionally filtered by project_id)")
 @handle_errors
-async def list_schemas(request: Request):
+async def list_schemas(request: Request, project_id: str | None = None):
     from ..db.repositories.datastore_repo import list_schemas as _list
-    schemas = await _list()
-    return {"status": "success", "count": len(schemas), "schemas": schemas}
+    schemas = await _list(project_id)
+    return {"status": "success", "count": len(schemas), "schemas": schemas, "project_id": project_id}
 
 
 # ── 6. Get schema for one table ────────────────────────────────
@@ -476,3 +505,43 @@ async def get_domain_translations(domain_model_id: str, request: Request):
         "domain_model_id": domain_model_id,
         "data":            grouped,
     }
+
+
+# ── 14. List all validation rules ──────────────────────────────
+
+@router.get("/validation-rules", summary="List every named validation rule in the registry")
+@handle_errors
+async def list_validation_rules_route(request: Request):
+    from ..db.repositories.datastore_repo import list_validation_rules as _list
+    rules = await _list()
+    return {"status": "success", "count": len(rules), "rules": rules}
+
+
+# ── 15. Create or update a validation rule ─────────────────────
+
+@router.post("/validation-rules", summary="Create or update (upsert, keyed by tag) a named validation rule")
+@handle_errors
+async def save_validation_rule_route(body: ValidationRuleRequest, request: Request):
+    """
+    Upserts one row in validation_rules, keyed by `tag`. Backs the
+    "Create new rule" flow in the Schema Inspector's field builder — see
+    apiSaveValidationRule() in the frontend's datastoreApi.ts.
+    """
+    from ..db.repositories.datastore_repo import save_validation_rule as _save
+
+    if not body.tag.strip():
+        raise HTTPException(status_code=400, detail="tag is required")
+
+    rule = body.model_dump(exclude={"tag"}, exclude_none=True)
+    result = await _save(body.tag.strip(), rule)
+    if result.get("status") == "error":
+        raise HTTPException(status_code=400, detail=result.get("message", "Could not save validation rule"))
+    return result
+
+@router.delete("/validation-rules/{tag}")
+async def delete_validation_rule_endpoint(tag: str):
+    from app.db.repositories.postgres.datastore_repo import delete_validation_rule
+    result = await delete_validation_rule(tag)
+    if result.get("status") != "success":
+        raise HTTPException(status_code=500, detail=result.get("message"))
+    return result

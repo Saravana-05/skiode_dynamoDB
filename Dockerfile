@@ -1,26 +1,20 @@
-# ── AWS Lambda container image for FastAPI (Python 3.12) ──────────────────────
-# Base image: AWS-managed Lambda runtime — includes the Lambda RIC and correct
-# directory layout. LAMBDA_TASK_ROOT is pre-set to /var/task.
-FROM public.ecr.aws/lambda/python:3.12
+FROM python:3.12-slim
 
-# Install Python dependencies into the Lambda task root so they are on sys.path
-COPY requirements.txt ${LAMBDA_TASK_ROOT}/
-RUN pip install --no-cache-dir --upgrade pip \
- && pip install --no-cache-dir -r ${LAMBDA_TASK_ROOT}/requirements.txt
+WORKDIR /app
 
-# Copy application source — puts app/ at /var/task/app/
-COPY app/ ${LAMBDA_TASK_ROOT}/app/
+ENV PYTHONDONTWRITEBYTECODE=1
+ENV PYTHONUNBUFFERED=1
 
-# DO NOT copy .env — all config is supplied via Lambda Environment Variables.
-# Set these in the Lambda console (or via terraform / SAM):
-#   DB_BACKEND            dynamodb  |  postgresql
-#   DB_HOST, DB_PORT, DB_NAME, DB_USER, DB_PASSWORD, DB_SSLMODE
-#   AWS_REGION, AWS_ACCESS_KEY_ID, AWS_SECRET_ACCESS_KEY  (or use IAM role)
-#   GOOGLE_CLIENT_ID, GOOGLE_CLIENT_SECRET, GOOGLE_REDIRECT_URI
-#   OUTLOOK_CLIENT_ID, OUTLOOK_CLIENT_SECRET, OUTLOOK_REDIRECT_URI
-#   DJANGO_SECRET_KEY, ALGORITHM, ACCESS_TOKEN_EXPIRE_MINUTES
-#   REFRESH_TOKEN_EXPIRE_DAYS, EMAIL_HOST, EMAIL_PORT
-#   EMAIL_HOST_USER, EMAIL_HOST_PASSWORD, SITE_URL
+COPY requirements.txt .
+RUN pip install --no-cache-dir --upgrade pip
+RUN pip install --no-cache-dir -r requirements.txt
 
-# Lambda handler — matches handler = Mangum(app) in app/main.py
-CMD ["app.main.handler"]
+COPY app ./app
+
+# CockroachDB CA cert is mounted at runtime (docker run -v ...), not baked into
+# the image, since this repo is public and the cert/env must never be committed.
+ENV SSL_CERT_FILE=/certs/root.crt
+
+EXPOSE 8000
+
+CMD ["uvicorn", "app.main:app", "--host", "0.0.0.0", "--port", "8000"]
