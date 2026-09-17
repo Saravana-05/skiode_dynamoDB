@@ -6,9 +6,34 @@ on:
       - keerthana-dev
 
 jobs:
-  deploy:
+  build-and-push:
     runs-on: ubuntu-latest
+    env:
+      IMAGE_NAME: skiode-backend
+      IMAGE_TAG: ${{ github.sha }}
     steps:
+      - name: Checkout Source
+        uses: actions/checkout@v4
+
+      - name: Set Docker Username
+        run: echo "DOCKERHUB_USER=${{ secrets.DOCKER_USERNAME }}" >> $GITHUB_ENV
+
+      - name: Login to Docker Hub
+        uses: docker/login-action@v3
+        with:
+          username: ${{ secrets.DOCKER_USERNAME }}
+          password: ${{ secrets.DOCKER_PASSWORD }}
+
+      - name: Build and Push Docker Image
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          file: ./Dockerfile
+          push: true
+          tags: |
+            ${{ env.DOCKERHUB_USER }}/${{ env.IMAGE_NAME }}:${{ env.IMAGE_TAG }}
+            ${{ env.DOCKERHUB_USER }}/${{ env.IMAGE_NAME }}:latest
+
       - name: Deploy to Server
         uses: appleboy/ssh-action@v1.2.2
         with:
@@ -16,20 +41,11 @@ jobs:
           username: ${{ secrets.SERVER_USER }}
           password: ${{ secrets.SERVER_PASSWORD }}
           script: |
-            REPO_DIR=/home/dev/repos/skiode-backend
+            IMAGE=${{ env.DOCKERHUB_USER }}/${{ env.IMAGE_NAME }}:${{ env.IMAGE_TAG }}
             ENV_FILE=/home/dev/skiode_dynamoDB/.env
             CERT_FILE=/home/dev/skiode_dynamoDB/certs/root.crt
 
-            if [ ! -d "$REPO_DIR" ]; then
-              git clone https://github.com/Saravana-05/skiode_dynamoDB.git "$REPO_DIR"
-            fi
-
-            cd "$REPO_DIR"
-            git fetch origin
-            git checkout keerthana-dev
-            git pull origin keerthana-dev
-
-            docker build -t skiode-backend .
+            docker pull "$IMAGE"
             docker rm -f skiode-backend || true
             docker run -d \
               --name skiode-backend \
@@ -37,6 +53,6 @@ jobs:
               --env-file "$ENV_FILE" \
               -v "$CERT_FILE:/certs/root.crt:ro" \
               --restart unless-stopped \
-              skiode-backend
+              "$IMAGE"
 
             docker image prune -f
