@@ -55,6 +55,7 @@ async def _ensure_drafts_table() -> None:
             id           SERIAL PRIMARY KEY,
             domain_name  VARCHAR NOT NULL,
             project_id   INTEGER,
+            module_id    INTEGER,
             status       VARCHAR NOT NULL DEFAULT 'draft',
             payload      TEXT    NOT NULL,
             created_by   VARCHAR,
@@ -63,6 +64,11 @@ async def _ensure_drafts_table() -> None:
             submitted_at VARCHAR
         )
         """
+    )
+    # Modules (Project → Module → Domain model). Added separately so
+    # drafts tables created before Modules existed pick the column up too.
+    await execute(
+        "ALTER TABLE domain_model_drafts ADD COLUMN IF NOT EXISTS module_id INTEGER"
     )
     # One live draft per (domain, project). project_id is nullable, and
     # NULLs don't compare equal in a plain unique index, so COALESCE it
@@ -91,6 +97,7 @@ def _row_to_wire(row) -> dict:
         "id":           str(row["id"]),
         "domain_name":  row["domain_name"],
         "project_id":   str(row["project_id"]) if row["project_id"] is not None else None,
+        "module_id":    str(row["module_id"]) if row["module_id"] is not None else None,
         "status":       row["status"],
         "payload":      payload,
         "created_by":   row["created_by"],
@@ -107,6 +114,7 @@ async def save_draft(
     payload: dict,
     project_id: int | str | None = None,
     created_by: str | None = None,
+    module_id: int | str | None = None,
 ) -> dict:
     """
     Create or update a draft. Deliberately does NOT touch
@@ -118,6 +126,7 @@ async def save_draft(
     await _ensure_drafts_table()
     now = datetime.now(timezone.utc).isoformat()
     pid = int(project_id) if project_id not in (None, "") else None
+    mid = int(module_id) if module_id not in (None, "") else None
 
     existing = await fetchrow(
         "SELECT id FROM domain_model_drafts "
@@ -132,14 +141,15 @@ async def save_draft(
                SET payload      = $1,
                    status       = 'draft',
                    updated_at   = $2,
-                   submitted_at = NULL
+                   submitted_at = NULL,
+                   module_id    = COALESCE($4::INTEGER, module_id)
              WHERE id = $3
             """,
-            json.dumps(payload), now, existing["id"],
+            json.dumps(payload), now, existing["id"], mid,
         )
         draft_id = existing["id"]
     else:
-        draft_id = await _insert(domain_name, pid, payload, created_by, now)
+        draft_id = await _insert(domain_name, pid, payload, created_by, now, mid)
 
     return {
         "status":   "success",
@@ -152,15 +162,15 @@ async def save_draft(
     }
 
 
-async def _insert(domain_name, pid, payload, created_by, now) -> int:
+async def _insert(domain_name, pid, payload, created_by, now, mid=None) -> int:
     row = await fetchrow(
         """
         INSERT INTO domain_model_drafts
-            (domain_name, project_id, status, payload, created_by, created_at, updated_at)
-        VALUES ($1, $2, 'draft', $3, $4, $5, $5)
+            (domain_name, project_id, module_id, status, payload, created_by, created_at, updated_at)
+        VALUES ($1, $2, $6, 'draft', $3, $4, $5, $5)
         RETURNING id
         """,
-        domain_name, pid, json.dumps(payload), created_by, now,
+        domain_name, pid, json.dumps(payload), created_by, now, mid,
     )
     return row["id"]
 
@@ -170,6 +180,7 @@ async def _insert(domain_name, pid, payload, created_by, now) -> int:
 async def list_drafts(
     project_id: int | str | None = None,
     status: str | None = "draft",
+    module_id: int | str | None = None,
 ) -> list[dict]:
     await _ensure_drafts_table()
 
@@ -177,6 +188,9 @@ async def list_drafts(
     if project_id not in (None, ""):
         args.append(int(project_id))
         clauses.append(f"project_id = ${len(args)}")
+    if module_id not in (None, ""):
+        args.append(int(module_id))
+        clauses.append(f"module_id = ${len(args)}")
     if status:
         args.append(status)
         clauses.append(f"status = ${len(args)}")
@@ -240,6 +254,7 @@ async def submit_draft(draft_id: int | str) -> dict:
     from ..datastore_repo import create_table_from_schema, save_schema
 
     project_id = draft.get("project_id")
+    module_id  = draft.get("module_id")
     results: list[dict] = []
 
     for spec in tables:
@@ -249,7 +264,11 @@ async def submit_draft(draft_id: int | str) -> dict:
             continue
         try:
             created = await create_table_from_schema(table_name, schema)
-            await save_schema(table_name, schema, spec.get("project_id", project_id))
+            await save_schema(
+                table_name, schema,
+                spec.get("project_id", project_id),
+                spec.get("module_id", module_id),
+            )
             results.append({
                 "table_name": table_name,
                 "created":    bool(created.get("created")),

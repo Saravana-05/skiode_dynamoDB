@@ -22,22 +22,30 @@ def _repo():
     return r
 
 
-async def save_schema(table_name: str, schema: list, project_id: int | str | None = None) -> None:
-    # project_id (Projects feature) is currently PostgreSQL-only.
+async def save_schema(
+    table_name: str,
+    schema: list,
+    project_id: int | str | None = None,
+    module_id: int | str | None = None,
+) -> None:
+    # project_id / module_id (Projects + Modules) are currently PostgreSQL-only.
     if _backend == "dynamodb":
         return await _repo().save_schema(table_name, schema)
-    return await _repo().save_schema(table_name, schema, project_id)
+    return await _repo().save_schema(table_name, schema, project_id, module_id)
 
 
 async def get_schema(table_name: str) -> list | None:
     return await _repo().get_schema(table_name)
 
 
-async def list_schemas(project_id: int | str | None = None) -> list[dict]:
-    # project_id (Projects feature) is currently PostgreSQL-only.
+async def list_schemas(
+    project_id: int | str | None = None,
+    module_id: int | str | None = None,
+) -> list[dict]:
+    # project_id / module_id (Projects + Modules) are currently PostgreSQL-only.
     if _backend == "dynamodb":
         return await _repo().list_schemas()
-    return await _repo().list_schemas(project_id)
+    return await _repo().list_schemas(project_id, module_id)
 
 
 async def create_table_from_schema(table_name: str, schema: list) -> dict:

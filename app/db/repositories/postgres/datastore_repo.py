@@ -68,13 +68,22 @@ async def _ensure_datastore_schemas_table() -> None:
     await execute(
         "ALTER TABLE datastore_schemas ADD COLUMN IF NOT EXISTS project_id INTEGER"
     )
+    # Modules (Project → Module → Domain model): nullable for the same reason.
+    await execute(
+        "ALTER TABLE datastore_schemas ADD COLUMN IF NOT EXISTS module_id INTEGER"
+    )
     print("[datastore] Meta-table 'datastore_schemas' ready (PostgreSQL).")
     _schemas_table_ready = True
 
 
 # ── schema meta-table helpers ────────────────────────────────────
 
-async def save_schema(table_name: str, schema: list, project_id: int | str | None = None) -> None:
+async def save_schema(
+    table_name: str,
+    schema: list,
+    project_id: int | str | None = None,
+    module_id: int | str | None = None,
+) -> None:
     await _ensure_datastore_schemas_table()
     now = datetime.now(timezone.utc).isoformat()
     # Note: project_id is only ever SET on INSERT or when a value is
@@ -83,22 +92,24 @@ async def save_schema(table_name: str, schema: list, project_id: int | str | Non
     # the domain model from the project it already belongs to.
     await execute(
         """
-        INSERT INTO datastore_schemas (table_name, schema, created_at, project_id)
-        VALUES ($1, $2, $3, $4)
+        INSERT INTO datastore_schemas (table_name, schema, created_at, project_id, module_id)
+        VALUES ($1, $2, $3, $4, $5)
         ON CONFLICT (table_name) DO UPDATE
             SET schema = EXCLUDED.schema,
                 created_at = EXCLUDED.created_at,
-                project_id = COALESCE(EXCLUDED.project_id, datastore_schemas.project_id)
+                project_id = COALESCE(EXCLUDED.project_id, datastore_schemas.project_id),
+                module_id  = COALESCE(EXCLUDED.module_id,  datastore_schemas.module_id)
         """,
         table_name, json.dumps(schema), now,
         int(project_id) if project_id is not None else None,
+        int(module_id) if module_id is not None else None,
     )
 
 
 async def get_schema(table_name: str) -> dict | None:
     await _ensure_datastore_schemas_table()
     row = await fetchrow(
-        "SELECT schema, project_id FROM datastore_schemas WHERE table_name = $1", table_name
+        "SELECT schema, project_id, module_id FROM datastore_schemas WHERE table_name = $1", table_name
     )
     if not row:
         return None
@@ -106,22 +117,28 @@ async def get_schema(table_name: str) -> dict | None:
         "schema":     json.loads(row["schema"]),
         "db_backend": "postgresql",
         "project_id": str(row["project_id"]) if row["project_id"] is not None else None,
+        "module_id":  str(row["module_id"]) if row["module_id"] is not None else None,
     }
 
 
-async def list_schemas(project_id: int | str | None = None) -> list[dict]:
+async def list_schemas(
+    project_id: int | str | None = None,
+    module_id: int | str | None = None,
+) -> list[dict]:
     await _ensure_datastore_schemas_table()
+    clauses, args = [], []
     if project_id is not None:
-        rows = await fetch(
-            "SELECT table_name, schema, created_at, project_id FROM datastore_schemas "
-            "WHERE project_id = $1 ORDER BY created_at DESC",
-            int(project_id),
-        )
-    else:
-        rows = await fetch(
-            "SELECT table_name, schema, created_at, project_id FROM datastore_schemas "
-            "ORDER BY created_at DESC"
-        )
+        args.append(int(project_id))
+        clauses.append(f"project_id = ${len(args)}")
+    if module_id is not None:
+        args.append(int(module_id))
+        clauses.append(f"module_id = ${len(args)}")
+    where = f"WHERE {' AND '.join(clauses)} " if clauses else ""
+    rows = await fetch(
+        "SELECT table_name, schema, created_at, project_id, module_id FROM datastore_schemas "
+        f"{where}ORDER BY created_at DESC",
+        *args,
+    )
     return [
         {
             "table_name": r["table_name"],
@@ -129,6 +146,7 @@ async def list_schemas(project_id: int | str | None = None) -> list[dict]:
             "created_at": str(r["created_at"]) if r["created_at"] else None,
             "db_backend": "postgresql",
             "project_id": str(r["project_id"]) if r["project_id"] is not None else None,
+            "module_id":  str(r["module_id"]) if r["module_id"] is not None else None,
         }
         for r in rows
     ]
