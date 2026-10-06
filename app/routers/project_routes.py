@@ -10,7 +10,10 @@ existing/global domain models keep working unchanged.
   2. GET    /projects            → list all projects
   3. GET    /projects/{id}       → get one project
   4. PUT    /projects/{id}       → update a project
-  5. DELETE /projects/{id}       → delete a project
+  5. DELETE /projects/{id}       → delete a project (also removes its modules)
+
+Modules (see module_routes.py) live inside a project:
+Project → Module → Domain model.
 """
 from fastapi import APIRouter, HTTPException, Request
 from pydantic import BaseModel

@@ -1,4 +1,4 @@
-from ..db.repositories.postgres import project_repo
+from ..db.repositories.postgres import project_repo, module_repo
 
 
 async def create_project(payload: dict) -> dict:
@@ -40,5 +40,8 @@ async def delete_project(project_id: str) -> dict:
     existing = await project_repo.get_project(project_id)
     if not existing:
         return {"status": "error", "message": f"Project '{project_id}' not found"}
+    # Modules can't outlive their project. Their domain models are kept
+    # (detached from the module), same leniency projects already had.
+    await module_repo.delete_modules_of_project(project_id)
     await project_repo.delete_project(project_id)
     return {"status": "success", "message": f"Project '{project_id}' deleted"}

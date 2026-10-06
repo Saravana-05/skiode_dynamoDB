@@ -14,17 +14,19 @@ async def save_draft(
     payload: dict,
     project_id: int | str | None = None,
     created_by: str | None = None,
+    module_id: int | str | None = None,
 ) -> dict:
     from .postgres.domain_draft_repo import save_draft as _save
-    return await _save(domain_name, payload, project_id, created_by)
+    return await _save(domain_name, payload, project_id, created_by, module_id)
 
 
 async def list_drafts(
     project_id: int | str | None = None,
     status: str | None = "draft",
+    module_id: int | str | None = None,
 ) -> list[dict]:
     from .postgres.domain_draft_repo import list_drafts as _list
-    return await _list(project_id, status)
+    return await _list(project_id, status, module_id)
 
 
 async def get_draft(draft_id: int | str) -> dict | None:
