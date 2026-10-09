@@ -818,3 +818,187 @@ async def save_validation_rule(tag: str, rule: dict) -> dict:
     except Exception as e:
         print(f"[datastore] WARNING: Could not save validation rule '{tag}': {e}")
         return {"status": "error", "message": str(e)}
+
+# ════════════════════════════════════════════════════════════════════════
+# Domain model management — rename / delete a domain, rename / retype /
+# delete a field. Schema JSON in datastore_schemas stays the source of
+# truth for the UI; the physical table/columns are changed to match.
+# ════════════════════════════════════════════════════════════════════════
+
+import re as _re
+
+_IDENT_RE = _re.compile(r"^[A-Za-z_][A-Za-z0-9_]*$")
+_PROTECTED_COLS = {"id", "created_at", "deleted_at"}
+
+
+def _check_ident(name: str, what: str) -> str:
+    if not name or not _IDENT_RE.match(name):
+        raise ValueError(f"Invalid {what} '{name}' — use letters, digits and underscores only.")
+    return name
+
+
+async def delete_domain(table_name: str, drop_table: bool = True) -> dict:
+    """Remove a domain model: its schema row, its attribute/translation
+    rows, and (by default) the physical table with all its data."""
+    try:
+        _check_ident(table_name, "table name")
+        await _ensure_datastore_schemas_table()
+        existing = await fetchrow(
+            "SELECT 1 FROM datastore_schemas WHERE table_name = $1", table_name
+        )
+        if not existing:
+            return {"status": "error", "code": 404, "message": f"Domain '{table_name}' not found"}
+
+        if drop_table:
+            await execute(f'DROP TABLE IF EXISTS "{table_name}"')
+        await execute("DELETE FROM datastore_schemas WHERE table_name = $1", table_name)
+
+        await _ensure_domain_attributes_table()
+        await _ensure_attribute_translations_table()   # translations cascade from attributes
+        await execute("DELETE FROM domain_attributes WHERE dmo_name = $1", table_name)
+        print(f"[datastore] Domain '{table_name}' deleted (drop_table={drop_table}).")
+        return {"status": "success", "table_name": table_name, "table_dropped": drop_table}
+    except Exception as e:
+        return {"status": "error", "code": 400, "message": str(e)}
+
+
+async def rename_domain(
+    old_name: str,
+    new_name: str,
+    project_id: int | str | None = None,
+    module_id: int | str | None = None,
+    move_scope: bool = False,
+) -> dict:
+    """Rename a domain model (table + schema row + attribute rows) and/or
+    move it to another project/module (move_scope=True; None clears)."""
+    try:
+        _check_ident(old_name, "table name")
+        _check_ident(new_name, "new table name")
+        await _ensure_datastore_schemas_table()
+        if not await fetchrow("SELECT 1 FROM datastore_schemas WHERE table_name = $1", old_name):
+            return {"status": "error", "code": 404, "message": f"Domain '{old_name}' not found"}
+
+        if new_name != old_name:
+            if await fetchrow("SELECT 1 FROM datastore_schemas WHERE table_name = $1", new_name):
+                return {"status": "error", "code": 409, "message": f"A domain named '{new_name}' already exists"}
+            await execute(f'ALTER TABLE IF EXISTS "{old_name}" RENAME TO "{new_name}"')
+            await execute("UPDATE datastore_schemas SET table_name = $1 WHERE table_name = $2", new_name, old_name)
+            await _ensure_domain_attributes_table()
+            await execute("UPDATE domain_attributes SET dmo_name = $1 WHERE dmo_name = $2", new_name, old_name)
+
+        if move_scope:
+            await execute(
+                "UPDATE datastore_schemas SET project_id = $1, module_id = $2 WHERE table_name = $3",
+                int(project_id) if project_id not in (None, "") else None,
+                int(module_id) if module_id not in (None, "") else None,
+                new_name,
+            )
+        return {"status": "success", "table_name": new_name, "old_name": old_name}
+    except Exception as e:
+        return {"status": "error", "code": 400, "message": str(e)}
+
+
+async def delete_field(table_name: str, field_id: str) -> dict:
+    """Remove one attribute: from the schema JSON, the table column, and
+    the attribute/translation rows."""
+    try:
+        _check_ident(table_name, "table name")
+        _check_ident(field_id, "field id")
+        if field_id in _PROTECTED_COLS:
+            return {"status": "error", "code": 400, "message": f"'{field_id}' is a system column and can't be deleted"}
+        current = await get_schema(table_name)
+        if not current:
+            return {"status": "error", "code": 404, "message": f"Domain '{table_name}' not found"}
+        schema = current["schema"]
+        new_schema = [f for f in schema if f.get("field_id") != field_id]
+        if len(new_schema) == len(schema):
+            return {"status": "error", "code": 404, "message": f"Field '{field_id}' not found in '{table_name}'"}
+
+        await execute(f'ALTER TABLE IF EXISTS "{table_name}" DROP COLUMN IF EXISTS "{field_id}"')
+        await execute(
+            "UPDATE datastore_schemas SET schema = $1 WHERE table_name = $2",
+            json.dumps(new_schema), table_name,
+        )
+        await _ensure_domain_attributes_table()
+        await _ensure_attribute_translations_table()
+        await execute(
+            "DELETE FROM domain_attributes WHERE dmo_name = $1 AND dmo_attribute_name = $2",
+            table_name, field_id,
+        )
+        return {"status": "success", "table_name": table_name, "field_id": field_id}
+    except Exception as e:
+        return {"status": "error", "code": 400, "message": str(e)}
+
+
+async def update_field(
+    table_name: str,
+    field_id: str,
+    new_field_id: str | None = None,
+    new_type: str | None = None,
+    new_label: str | None = None,
+) -> dict:
+    """Rename and/or retype one attribute — the column is altered to match
+    and the schema JSON entry updated. Other schema keys (ui_config, rbac,
+    validations…) are left as-is; the caller follows up with a normal
+    save (POST /datastore/create) to write the full edited definition."""
+    try:
+        _check_ident(table_name, "table name")
+        _check_ident(field_id, "field id")
+        target = new_field_id or field_id
+        _check_ident(target, "new field id")
+        if field_id in _PROTECTED_COLS or target in _PROTECTED_COLS:
+            return {"status": "error", "code": 400, "message": "System columns can't be edited"}
+
+        current = await get_schema(table_name)
+        if not current:
+            return {"status": "error", "code": 404, "message": f"Domain '{table_name}' not found"}
+        schema = current["schema"]
+        entry = next((f for f in schema if f.get("field_id") == field_id), None)
+        if entry is None:
+            return {"status": "error", "code": 404, "message": f"Field '{field_id}' not found in '{table_name}'"}
+        if target != field_id and any(f.get("field_id") == target for f in schema):
+            return {"status": "error", "code": 409, "message": f"Field '{target}' already exists in '{table_name}'"}
+
+        if target != field_id:
+            await execute(f'ALTER TABLE IF EXISTS "{table_name}" RENAME COLUMN "{field_id}" TO "{target}"')
+            entry["field_id"] = target
+        if new_type and new_type != entry.get("type"):
+            pg_type = _PG_TYPE.get(new_type)
+            if not pg_type:
+                return {"status": "error", "code": 400, "message": f"Unsupported type '{new_type}'"}
+            await execute(
+                f'ALTER TABLE IF EXISTS "{table_name}" ALTER COLUMN "{target}" TYPE {pg_type} '
+                f'USING "{target}"::{pg_type}'
+            )
+            entry["type"] = new_type
+        if new_label is not None:
+            entry["label"] = new_label
+
+        await execute(
+            "UPDATE datastore_schemas SET schema = $1 WHERE table_name = $2",
+            json.dumps(schema), table_name,
+        )
+        if target != field_id:
+            await _ensure_domain_attributes_table()
+            await _ensure_attribute_translations_table()
+            # The UI saves the attribute under its NEW name before calling
+            # this, so a row for `target` usually exists already (with the
+            # latest labels). Keep that one and drop the stale old row;
+            # only rename when there is no row for the new name yet.
+            if await fetchrow(
+                "SELECT 1 FROM domain_attributes WHERE dmo_name = $1 AND dmo_attribute_name = $2",
+                table_name, target,
+            ):
+                await execute(
+                    "DELETE FROM domain_attributes WHERE dmo_name = $1 AND dmo_attribute_name = $2",
+                    table_name, field_id,
+                )
+            else:
+                await execute(
+                    "UPDATE domain_attributes SET dmo_attribute_name = $1 "
+                    "WHERE dmo_name = $2 AND dmo_attribute_name = $3",
+                    target, table_name, field_id,
+                )
+        return {"status": "success", "table_name": table_name, "field_id": target, "old_field_id": field_id}
+    except Exception as e:
+        return {"status": "error", "code": 400, "message": str(e)}

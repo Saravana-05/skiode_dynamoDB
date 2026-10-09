@@ -126,8 +126,33 @@ async def save_validation_rule(tag: str, rule: dict) -> dict:
     return await _save(tag, rule)
 
 
+# ── Domain model management — PostgreSQL only (same as validation rules) ──
+
+async def delete_domain(table_name: str, drop_table: bool = True) -> dict:
+    from .postgres.datastore_repo import delete_domain as _f
+    return await _f(table_name, drop_table)
+
+
+async def rename_domain(old_name: str, new_name: str, project_id=None, module_id=None, move_scope: bool = False) -> dict:
+    from .postgres.datastore_repo import rename_domain as _f
+    return await _f(old_name, new_name, project_id, module_id, move_scope)
+
+
+async def delete_field(table_name: str, field_id: str) -> dict:
+    from .postgres.datastore_repo import delete_field as _f
+    return await _f(table_name, field_id)
+
+
+async def update_field(table_name: str, field_id: str, new_field_id=None, new_type=None, new_label=None) -> dict:
+    from .postgres.datastore_repo import update_field as _f
+    return await _f(table_name, field_id, new_field_id, new_type, new_label)
+
 
 __all__ = [
+    "delete_domain",
+    "rename_domain",
+    "delete_field",
+    "update_field",
     "get_backend",
     "set_backend",
     "save_schema",
