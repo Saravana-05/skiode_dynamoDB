@@ -603,6 +603,69 @@ async def get_schema_route(table_name: str, request: Request):
     }
 
 
+# ── 6b. Domain model management (edit / delete) ────────────────
+
+class RenameDomainRequest(BaseModel):
+    new_table_name: str | None = None
+    # Send project_id / module_id (null clears them) to move the domain.
+    project_id: str | int | None = None
+    module_id: str | int | None = None
+
+    model_config = {"extra": "forbid"}
+
+
+class UpdateFieldRequest(BaseModel):
+    new_field_id: str | None = None
+    type: str | None = None
+    label: str | None = None
+
+
+def _raise_if_error(result: dict):
+    if result.get("status") == "error":
+        raise HTTPException(status_code=result.get("code", 400), detail=result.get("message", "Request failed"))
+
+
+@router.put("/schemas/{table_name}", summary="Rename a domain model and/or move it to another project/module")
+@handle_errors
+async def update_domain_route(table_name: str, body: RenameDomainRequest, request: Request):
+    from ..db.repositories.datastore_repo import rename_domain as _rename
+    fields_sent = body.model_fields_set
+    move = "project_id" in fields_sent or "module_id" in fields_sent
+    project_id, module_id = body.project_id, body.module_id
+    if move:
+        project_id, module_id = await _resolve_scope(project_id, module_id)
+    result = await _rename(table_name, body.new_table_name or table_name, project_id, module_id, move)
+    _raise_if_error(result)
+    return result
+
+
+@router.delete("/schemas/{table_name}", summary="Delete a domain model (schema, attributes and — by default — its table and data)")
+@handle_errors
+async def delete_domain_route(table_name: str, request: Request, drop_table: bool = True):
+    from ..db.repositories.datastore_repo import delete_domain as _delete
+    result = await _delete(table_name, drop_table)
+    _raise_if_error(result)
+    return result
+
+
+@router.put("/schemas/{table_name}/fields/{field_id}", summary="Rename and/or retype one attribute of a domain model")
+@handle_errors
+async def update_field_route(table_name: str, field_id: str, body: UpdateFieldRequest, request: Request):
+    from ..db.repositories.datastore_repo import update_field as _update
+    result = await _update(table_name, field_id, body.new_field_id, body.type, body.label)
+    _raise_if_error(result)
+    return result
+
+
+@router.delete("/schemas/{table_name}/fields/{field_id}", summary="Delete one attribute (schema entry, column and labels)")
+@handle_errors
+async def delete_field_route(table_name: str, field_id: str, request: Request):
+    from ..db.repositories.datastore_repo import delete_field as _delete
+    result = await _delete(table_name, field_id)
+    _raise_if_error(result)
+    return result
+
+
 # ── 7. Update a row ────────────────────────────────────────────
 
 @router.put("/{table_name}/row/{record_id}", summary="Update a row by ID")
