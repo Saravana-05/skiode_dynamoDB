@@ -62,6 +62,11 @@ async def create(username, email, password, is_superuser, is_staff, is_active,
                  profile_pic=None, is_lead=False):
     if isinstance(date_joined, str):
         date_joined = datetime.fromisoformat(date_joined)
+    # auth_user.date_joined is "timestamp without time zone": asyncpg rejects
+    # tz-aware values for it, so store naive UTC.
+    if getattr(date_joined, "tzinfo", None) is not None:
+        from datetime import timezone as _tz
+        date_joined = date_joined.astimezone(_tz.utc).replace(tzinfo=None)
 
     user_row = await fetchrow(
         """
@@ -78,7 +83,8 @@ async def create(username, email, password, is_superuser, is_staff, is_active,
         INSERT INTO form_generator_userdata (user_name, mail_id, password, is_active, organization_id, user_id)
         VALUES ($1,$2,$3,$4,$5,$6)
         """,
-        user_name, email, password, is_active, int(organization_id), user_id,
+        user_name, email, password, is_active,
+        int(organization_id) if organization_id else None, user_id,
     )
     return {"user_id": str(user_id), "email": email.strip().lower()}
 

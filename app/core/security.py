@@ -19,7 +19,7 @@ from ..core.config import settings
 #             detail=f"Invalid token: {str(e)}"
 #         )
 
-def verify_token(token: str):
+def verify_token(token: str, expected_type: str = "access"):
     try:
         payload = jwt.decode(
             token,
@@ -27,7 +27,7 @@ def verify_token(token: str):
             algorithms=[settings.ALGORITHM]
         )
 
-        if payload.get("token_type") != "access":
+        if payload.get("token_type") != expected_type:
             raise Exception("Invalid token type")
 
         if "user_id" not in payload:
@@ -40,4 +40,3 @@ def verify_token(token: str):
             status_code=401,
             detail="Invalid or expired token"
         )
-

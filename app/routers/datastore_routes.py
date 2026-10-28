@@ -51,15 +51,75 @@ Domain attributes + multilingual labels:
 """
 import re
 from typing import Any
-from fastapi import APIRouter, Body, HTTPException, Request
+from fastapi import APIRouter, Body, Depends, HTTPException, Request
 from pydantic import BaseModel
 
 from ..utils.decorators import handle_errors
+from ..dependencies.rbac_dependency import require_permission
+from ..services import abac_service, rbac_service
+from ..db.repositories import rbac_repo
 
 router = APIRouter(prefix="/datastore", tags=["Datastore - Dynamic Tables"])
 
 
 # ── Server-side field validator ────────────────────────────────
+
+async def _apply_field_rules(request: Request, table_name: str, rows: list[dict]) -> list[dict]:
+    """Hide the columns the caller's roles may not read (domain ABAC 'fields')."""
+    user = getattr(request.state, "current_user", None)
+    if not user or rbac_service.is_admin(user):
+        return rows
+    try:
+        role_names = [r["name"] for r in await rbac_repo.get_user_roles(user["user_id"])]
+        return await abac_service.filter_rows(role_names, table_name, rows)
+    except Exception:
+        return rows
+
+
+async def _schema_viewer_roles(request: Request) -> list[str] | None:
+    """
+    Role names whose ABAC field rules must be applied to schema responses,
+    or None when the schema should be returned untouched: no/invalid token
+    (same as the row endpoints), admins, and anyone who can design domain
+    models ("domain_model" edit, same gate as editing ABAC rules) - they need
+    the full schema to build and secure it.
+    """
+    auth = request.headers.get("Authorization", "")
+    if not auth.lower().startswith("bearer "):
+        return None
+    try:
+        from ..core.security import verify_token
+        user = verify_token(auth.split(" ", 1)[1])
+    except HTTPException:
+        return None
+    if rbac_service.is_admin(user):
+        return None
+    if await rbac_service.user_has_permission(user, "domain_model", "edit"):
+        return None
+    return [r["name"] for r in await rbac_repo.get_user_roles(user["user_id"])]
+
+
+async def _apply_schema_rules(request: Request, table_name: str, schema: list[dict]) -> list[dict]:
+    """Hide the attributes the caller's roles may not read (domain ABAC 'fields')."""
+    try:
+        roles = await _schema_viewer_roles(request)
+        if roles is None:
+            return schema
+        return await abac_service.filter_schema(roles, table_name, schema)
+    except Exception:
+        return schema
+
+
+async def _apply_schemas_rules(request: Request, schemas: list[dict]) -> list[dict]:
+    """Same as _apply_schema_rules for a list of {table_name, schema, ...}."""
+    try:
+        roles = await _schema_viewer_roles(request)
+        if roles is None:
+            return schemas
+        return await abac_service.filter_schemas(roles, schemas)
+    except Exception:
+        return schemas
+
 
 def _validate_row(schema: list[dict], row_data: dict) -> dict[str, str]:
     """
@@ -464,7 +524,7 @@ async def submit_draft_route(draft_id: str, request: Request):
 
 # ── 2. Insert a row ────────────────────────────────────────────
 
-@router.post("/{table_name}/row", summary="Insert a row — each field stored as a separate column")
+@router.post("/{table_name}/row", dependencies=[Depends(require_permission("create"))], summary="Insert a row — each field stored as a separate column")
 @handle_errors
 async def insert_row(table_name: str, request: Request, body: dict[str, Any] = Body(...)):
     from ..db.repositories.datastore_repo import get_schema, insert_row as _insert
@@ -519,23 +579,25 @@ async def insert_row(table_name: str, request: Request, body: dict[str, Any] = B
 
 # ── 3. List all rows ───────────────────────────────────────────
 
-@router.get("/{table_name}/rows", summary="List all rows in a dynamic table")
+@router.get("/{table_name}/rows", dependencies=[Depends(require_permission("view"))], summary="List all rows in a dynamic table")
 @handle_errors
 async def list_rows(table_name: str, request: Request):
     from ..db.repositories.datastore_repo import list_rows as _list
     rows = await _list(table_name)
+    rows = await _apply_field_rules(request, table_name, rows)
     return {"status": "success", "table_name": table_name, "count": len(rows), "data": rows}
 
 
 # ── 4. Get one row ─────────────────────────────────────────────
 
-@router.get("/{table_name}/row/{record_id}", summary="Get one row by ID")
+@router.get("/{table_name}/row/{record_id}", dependencies=[Depends(require_permission("view"))], summary="Get one row by ID")
 @handle_errors
 async def get_row(table_name: str, record_id: str, request: Request):
     from ..db.repositories.datastore_repo import get_row as _get
     row = await _get(table_name, record_id)
     if not row:
         raise HTTPException(status_code=404, detail="Row not found")
+    row = (await _apply_field_rules(request, table_name, [row]))[0]
     return {"status": "success", "table_name": table_name, "data": row}
 
 
@@ -573,6 +635,7 @@ async def list_schemas(
 ):
     from ..db.repositories.datastore_repo import list_schemas as _list
     schemas = await _list(project_id, module_id)
+    schemas = await _apply_schemas_rules(request, schemas)
     return {
         "status": "success", "count": len(schemas), "schemas": schemas,
         "project_id": project_id, "module_id": module_id,
@@ -593,6 +656,7 @@ async def get_schema_route(table_name: str, request: Request):
         )
 
     schema_list = _extract_schema_list(schema_result)
+    schema_list = await _apply_schema_rules(request, table_name, schema_list)
     db_backend  = schema_result.get("db_backend", "postgresql") if isinstance(schema_result, dict) else "postgresql"
 
     return {
@@ -636,6 +700,11 @@ async def update_domain_route(table_name: str, body: RenameDomainRequest, reques
         project_id, module_id = await _resolve_scope(project_id, module_id)
     result = await _rename(table_name, body.new_table_name or table_name, project_id, module_id, move)
     _raise_if_error(result)
+    # Keep the domain's ABAC rules attached if the domain model was renamed.
+    new_name = body.new_table_name or table_name
+    if new_name != table_name:
+        from ..services import abac_service
+        await abac_service.rename_domain(table_name, new_name)
     return result
 
 
@@ -645,6 +714,9 @@ async def delete_domain_route(table_name: str, request: Request, drop_table: boo
     from ..db.repositories.datastore_repo import delete_domain as _delete
     result = await _delete(table_name, drop_table)
     _raise_if_error(result)
+    # Remove the deleted domain's ABAC rules so none are left orphaned.
+    from ..services import abac_service
+    await abac_service.delete_rules(table_name)
     return result
 
 
@@ -668,7 +740,7 @@ async def delete_field_route(table_name: str, field_id: str, request: Request):
 
 # ── 7. Update a row ────────────────────────────────────────────
 
-@router.put("/{table_name}/row/{record_id}", summary="Update a row by ID")
+@router.put("/{table_name}/row/{record_id}", dependencies=[Depends(require_permission("edit"))], summary="Update a row by ID")
 @handle_errors
 async def update_row(table_name: str, record_id: str, request: Request, body: dict[str, Any] = Body(...)):
     from ..db.repositories.datastore_repo import update_row as _update
@@ -680,7 +752,7 @@ async def update_row(table_name: str, record_id: str, request: Request, body: di
 
 # ── 8. Delete a row ────────────────────────────────────────────
 
-@router.delete("/{table_name}/row/{record_id}", summary="Delete a row by ID")
+@router.delete("/{table_name}/row/{record_id}", dependencies=[Depends(require_permission("delete"))], summary="Delete a row by ID")
 @handle_errors
 async def delete_row(table_name: str, record_id: str, request: Request):
     from ..db.repositories.datastore_repo import delete_row as _delete
@@ -692,7 +764,7 @@ async def delete_row(table_name: str, record_id: str, request: Request):
 
 # ── 9. List archived rows ──────────────────────────────────────
 
-@router.get("/{table_name}/archived", summary="List soft-deleted (archived) rows")
+@router.get("/{table_name}/archived", dependencies=[Depends(require_permission("view"))], summary="List soft-deleted (archived) rows")
 @handle_errors
 async def list_archived_rows(table_name: str, request: Request):
     from ..db.repositories.datastore_repo import list_archived_rows as _list_archived

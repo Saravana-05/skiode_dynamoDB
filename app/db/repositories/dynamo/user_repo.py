@@ -52,7 +52,7 @@ async def create(username, email, password, is_superuser, is_staff, is_active,
         "password": password, "is_superuser": is_superuser, "is_staff": is_staff,
         "is_active": is_active, "date_joined": date_joined, "user_name": user_name,
         "profile_pic": profile_pic, "user_profile_schema": "", "is_lead": is_lead,
-        "organization_id": str(organization_id),
+        "organization_id": str(organization_id) if organization_id else None,
         "usergroup_id": str(usergroup_id) if usergroup_id else None,
         "created_at": now, "updated_at": now,
     })
