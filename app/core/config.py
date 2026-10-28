@@ -55,6 +55,29 @@ class Settings(BaseSettings):
     TABLE_EMPLOYEE_DETAILS: str = "employee_details"
     TABLE_SCHEMAS: str = "datastore_schemas"
 
+    # RBAC DynamoDB tables (see app/db/init_rbac.py)
+    TABLE_RBAC_ROLES: str = "rbac_roles"
+    TABLE_RBAC_RESOURCES: str = "rbac_resources"
+    TABLE_RBAC_PERMISSIONS: str = "rbac_permissions"
+    TABLE_RBAC_ROLE_PERMISSIONS: str = "rbac_role_permissions"
+    TABLE_RBAC_USER_ROLES: str = "rbac_user_roles"
+
+    # RBAC enforcement on data endpoints (/datastore/{table}/row...).
+    # Set RBAC_ENFORCE=false to turn permission checks off (e.g. while you
+    # are still creating roles) - the /rbac admin API stays admin-only.
+    RBAC_ENFORCE: bool = True
+
+    # Allow READ-ONLY ("view") data requests that carry NO token (used by the
+    # token-less view-builder frontend). Requests that DO send a token are
+    # checked exactly as before, and create/edit/delete always need a token.
+    # Default False (secure) - set ALLOW_ANONYMOUS_VIEW=true in .env to enable.
+    ALLOW_ANONYMOUS_VIEW: bool = False
+
+    # DEV ONLY: also allow token-less create / edit / delete on data rows
+    # (so the token-less view-builder can submit forms). Tokens that ARE sent
+    # are still checked normally by the other frontend. Default False.
+    ALLOW_ANONYMOUS_WRITE: bool = False
+
     # django client secret
     DJANGO_SECRET_KEY: Optional[str] = None
     ALGORITHM: str = "HS256"

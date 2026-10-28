@@ -7,6 +7,7 @@ from ..db.repositories import user_repo, organization_repo
 from ..utils.password import verify_password, hash_password
 from ..utils.jwt import create_tokens
 from ..utils.okta import decode_okta_token
+from . import rbac_service
 
 import logging
 
@@ -113,6 +114,16 @@ async def login_user(payload):
 
         usergroup_name = usergroup.get("group_name") if usergroup else "is_superuser"
 
+        # RBAC: roles + effective permissions. The frontend uses these to
+        # show/hide UI; the backend re-checks them from the DB on every request.
+        # If the RBAC tables haven't been created yet (python -m app.db.init_rbac)
+        # don't lock everybody out of login - just return no permissions.
+        try:
+            rbac_ctx = await rbac_service.get_auth_context(user["user_id"])
+        except Exception as e:
+            logger.error(f"RBAC lookup failed (did you run app.db.init_rbac?): {e}")
+            rbac_ctx = {"roles": [], "permissions": []}
+
         return {
             "status": "success",
             "data": {
@@ -132,6 +143,8 @@ async def login_user(payload):
                 "is_lead": user.get("is_lead"),
                 "auth_type": auth_type,
                 "role": role,
+                "roles": rbac_ctx["roles"],
+                "permissions": rbac_ctx["permissions"],
             },
         }
 
