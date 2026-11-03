@@ -51,6 +51,8 @@ jobs:
               --name skiode-backend \
               -p 8080:8000 \
               --env-file "$ENV_FILE" \
+              -e ALLOW_ANONYMOUS_VIEW=true \
+              -e ALLOW_ANONYMOUS_WRITE=false \
               -v "$CERT_FILE:/certs/root.crt:ro" \
               --restart unless-stopped \
               "$IMAGE"

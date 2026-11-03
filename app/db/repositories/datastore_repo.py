@@ -76,6 +76,12 @@ async def delete_row(table_name: str, record_id: str) -> dict:
     return await _repo().delete_row(table_name, record_id)
 
 
+async def restore_row(table_name: str, record_id: str) -> dict:
+    # Soft-delete/archive is PostgreSQL-only (deleted_at column).
+    from .postgres.datastore_repo import restore_row as _f
+    return await _f(table_name, record_id)
+
+
 async def save_domain_attribute(
     domain_model_id: str,
     attribute_name: str,
@@ -165,6 +171,7 @@ __all__ = [
     "get_row",
     "update_row",
     "delete_row",
+    "restore_row",
     "save_domain_attribute",
     "list_domain_attributes",
     "save_attribute_translation",
