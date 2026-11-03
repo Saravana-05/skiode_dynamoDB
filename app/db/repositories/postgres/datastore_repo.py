@@ -72,6 +72,35 @@ async def _ensure_datastore_schemas_table() -> None:
     await execute(
         "ALTER TABLE datastore_schemas ADD COLUMN IF NOT EXISTS module_id INTEGER"
     )
+    # Safety net: whenever a domain model row disappears from
+    # datastore_schemas (API delete, manual DELETE in DBeaver, a script...),
+    # Postgres itself removes its attributes (attribute_translations cascade
+    # from domain_attributes via FK) and its relationships. No code path can
+    # forget to clean up.
+    await execute(
+        """
+        CREATE OR REPLACE FUNCTION cleanup_deleted_domain() RETURNS trigger AS $$
+        BEGIN
+            IF to_regclass('domain_attributes') IS NOT NULL THEN
+                DELETE FROM domain_attributes WHERE dmo_name = OLD.table_name;
+            END IF;
+            IF to_regclass('domain_relationships') IS NOT NULL THEN
+                DELETE FROM domain_relationships
+                WHERE from_dmo = OLD.table_name OR to_dmo = OLD.table_name;
+            END IF;
+            RETURN OLD;
+        END;
+        $$ LANGUAGE plpgsql
+        """
+    )
+    await execute("DROP TRIGGER IF EXISTS trg_cleanup_deleted_domain ON datastore_schemas")
+    await execute(
+        """
+        CREATE TRIGGER trg_cleanup_deleted_domain
+        AFTER DELETE ON datastore_schemas
+        FOR EACH ROW EXECUTE FUNCTION cleanup_deleted_domain()
+        """
+    )
     print("[datastore] Meta-table 'datastore_schemas' ready (PostgreSQL).")
     _schemas_table_ready = True
 
@@ -411,6 +440,26 @@ async def delete_row(table_name: str, record_id: str) -> dict:
             now, int(record_id)
         )
     return {"status": "success", "record_id": record_id}
+
+
+async def restore_row(table_name: str, record_id: str) -> dict:
+    """Undo delete_row: clear deleted_at so the archived row is active again."""
+    try:
+        _check_ident(table_name, "table name")
+        pool = await ensure_pool()
+        async with pool.acquire() as conn:
+            result = await conn.execute(
+                f'UPDATE "{table_name}" SET deleted_at = NULL '
+                f'WHERE id = $1 AND deleted_at IS NOT NULL',
+                int(record_id),
+            )
+        # asyncpg returns a command tag such as "UPDATE 1"
+        if result.endswith(" 0"):
+            return {"status": "error", "code": 404,
+                    "message": f"No archived record {record_id} found in '{table_name}'"}
+        return {"status": "success", "record_id": record_id}
+    except Exception as e:
+        return {"status": "error", "code": 400, "message": str(e)}
 
 
 # ════════════════════════════════════════════════════════════════════════
@@ -838,28 +887,62 @@ def _check_ident(name: str, what: str) -> str:
 
 
 async def delete_domain(table_name: str, drop_table: bool = True) -> dict:
-    """Remove a domain model: its schema row, its attribute/translation
-    rows, and (by default) the physical table with all its data."""
+    """Remove a domain model: its schema row, its attribute rows (translations
+    cascade from them), its relationships, and (by default) the physical table
+    with all its data. Everything runs in ONE transaction, so a failure part-way
+    leaves nothing half-deleted."""
     try:
         _check_ident(table_name, "table name")
         await _ensure_datastore_schemas_table()
+        await _ensure_domain_attributes_table()
+        await _ensure_attribute_translations_table()   # translations cascade from attributes
         existing = await fetchrow(
             "SELECT 1 FROM datastore_schemas WHERE table_name = $1", table_name
         )
         if not existing:
             return {"status": "error", "code": 404, "message": f"Domain '{table_name}' not found"}
 
-        if drop_table:
-            await execute(f'DROP TABLE IF EXISTS "{table_name}"')
-        await execute("DELETE FROM datastore_schemas WHERE table_name = $1", table_name)
-
-        await _ensure_domain_attributes_table()
-        await _ensure_attribute_translations_table()   # translations cascade from attributes
-        await execute("DELETE FROM domain_attributes WHERE dmo_name = $1", table_name)
-        print(f"[datastore] Domain '{table_name}' deleted (drop_table={drop_table}).")
+        pool = await ensure_pool()
+        async with pool.acquire() as conn:
+            async with conn.transaction():
+                # Attributes first (attribute_translations ON DELETE CASCADE).
+                attrs = await conn.execute(
+                    "DELETE FROM domain_attributes WHERE dmo_name = $1", table_name
+                )
+                if await conn.fetchval("SELECT to_regclass('domain_relationships')"):
+                    await conn.execute(
+                        "DELETE FROM domain_relationships WHERE from_dmo = $1 OR to_dmo = $1",
+                        table_name,
+                    )
+                await conn.execute("DELETE FROM datastore_schemas WHERE table_name = $1", table_name)
+                if drop_table:
+                    await conn.execute(f'DROP TABLE IF EXISTS "{table_name}"')
+        print(f"[datastore] Domain '{table_name}' deleted with its attributes "
+              f"({attrs}); drop_table={drop_table}.")
         return {"status": "success", "table_name": table_name, "table_dropped": drop_table}
     except Exception as e:
         return {"status": "error", "code": 400, "message": str(e)}
+
+
+async def purge_orphan_attributes() -> dict:
+    """One-off cleanup: delete domain_attributes (and their translations) whose
+    domain no longer exists in datastore_schemas, plus dangling relationships.
+    Safe to call any time (e.g. from an admin route)."""
+    await _ensure_datastore_schemas_table()
+    await _ensure_domain_attributes_table()
+    await _ensure_attribute_translations_table()
+    attrs = await execute(
+        "DELETE FROM domain_attributes WHERE dmo_name NOT IN (SELECT table_name FROM datastore_schemas)"
+    )
+    rels = "DELETE 0"
+    _rel = await fetchrow("SELECT to_regclass('domain_relationships') AS t")
+    if _rel and _rel["t"]:
+        rels = await execute(
+            "DELETE FROM domain_relationships "
+            "WHERE from_dmo NOT IN (SELECT table_name FROM datastore_schemas) "
+            "OR to_dmo NOT IN (SELECT table_name FROM datastore_schemas)"
+        )
+    return {"status": "success", "attributes_removed": attrs, "relationships_removed": rels}
 
 
 async def rename_domain(
@@ -885,6 +968,10 @@ async def rename_domain(
             await execute("UPDATE datastore_schemas SET table_name = $1 WHERE table_name = $2", new_name, old_name)
             await _ensure_domain_attributes_table()
             await execute("UPDATE domain_attributes SET dmo_name = $1 WHERE dmo_name = $2", new_name, old_name)
+            _rel = await fetchrow("SELECT to_regclass('domain_relationships') AS t")
+            if _rel and _rel["t"]:
+                await execute("UPDATE domain_relationships SET from_dmo = $1 WHERE from_dmo = $2", new_name, old_name)
+                await execute("UPDATE domain_relationships SET to_dmo = $1 WHERE to_dmo = $2", new_name, old_name)
 
         if move_scope:
             await execute(

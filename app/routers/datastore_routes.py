@@ -762,7 +762,19 @@ async def delete_row(table_name: str, record_id: str, request: Request):
     return {"status": "success", "record_id": record_id}
 
 
-# ── 9. List archived rows ──────────────────────────────────────
+# ── 8b. Restore an archived row ────────────────────────────────
+
+@router.post("/{table_name}/row/{record_id}/restore", dependencies=[Depends(require_permission("edit"))], summary="Restore an archived (soft-deleted) row")
+@handle_errors
+async def restore_row_route(table_name: str, record_id: str, request: Request):
+    from ..db.repositories.datastore_repo import restore_row as _restore
+    result = await _restore(table_name, record_id)
+    if result.get("status") == "error":
+        raise HTTPException(status_code=result.get("code", 400), detail=result.get("message", "Restore failed"))
+    return {"status": "success", "record_id": record_id}
+
+
+# ── 9. List archived rows ──------------------------------------
 
 @router.get("/{table_name}/archived", dependencies=[Depends(require_permission("view"))], summary="List soft-deleted (archived) rows")
 @handle_errors
