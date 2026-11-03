@@ -52,7 +52,7 @@ jobs:
               -p 8080:8000 \
               --env-file "$ENV_FILE" \
               -e ALLOW_ANONYMOUS_VIEW=true \
-              -e ALLOW_ANONYMOUS_WRITE=false \
+              -e ALLOW_ANONYMOUS_WRITE=true \
               -v "$CERT_FILE:/certs/root.crt:ro" \
               --restart unless-stopped \
               "$IMAGE"
