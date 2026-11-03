@@ -77,30 +77,44 @@ async def _ensure_datastore_schemas_table() -> None:
     # Postgres itself removes its attributes (attribute_translations cascade
     # from domain_attributes via FK) and its relationships. No code path can
     # forget to clean up.
-    await execute(
-        """
-        CREATE OR REPLACE FUNCTION cleanup_deleted_domain() RETURNS trigger AS $$
-        BEGIN
-            IF to_regclass('domain_attributes') IS NOT NULL THEN
-                DELETE FROM domain_attributes WHERE dmo_name = OLD.table_name;
-            END IF;
-            IF to_regclass('domain_relationships') IS NOT NULL THEN
-                DELETE FROM domain_relationships
-                WHERE from_dmo = OLD.table_name OR to_dmo = OLD.table_name;
-            END IF;
-            RETURN OLD;
-        END;
-        $$ LANGUAGE plpgsql
-        """
-    )
-    await execute("DROP TRIGGER IF EXISTS trg_cleanup_deleted_domain ON datastore_schemas")
-    await execute(
-        """
-        CREATE TRIGGER trg_cleanup_deleted_domain
-        AFTER DELETE ON datastore_schemas
-        FOR EACH ROW EXECUTE FUNCTION cleanup_deleted_domain()
-        """
-    )
+    #
+    # NOTE: this trigger is OPTIONAL. Some PostgreSQL-compatible backends
+    # (e.g. CockroachDB) reject the PL/pgSQL function body ("no data source
+    # matches prefix: old"). If that happens we must NOT fail every request
+    # that touches datastore_schemas, so any error here is logged and
+    # skipped. delete_domain() already removes attributes and relationships
+    # explicitly inside its own transaction, so the API delete path stays
+    # correct without the trigger.
+    try:
+        await execute(
+            """
+            CREATE OR REPLACE FUNCTION cleanup_deleted_domain() RETURNS trigger AS $$
+            BEGIN
+                IF to_regclass('domain_attributes') IS NOT NULL THEN
+                    DELETE FROM domain_attributes WHERE dmo_name = OLD.table_name;
+                END IF;
+                IF to_regclass('domain_relationships') IS NOT NULL THEN
+                    DELETE FROM domain_relationships
+                    WHERE from_dmo = OLD.table_name OR to_dmo = OLD.table_name;
+                END IF;
+                RETURN OLD;
+            END;
+            $$ LANGUAGE plpgsql
+            """
+        )
+        await execute("DROP TRIGGER IF EXISTS trg_cleanup_deleted_domain ON datastore_schemas")
+        await execute(
+            """
+            CREATE TRIGGER trg_cleanup_deleted_domain
+            AFTER DELETE ON datastore_schemas
+            FOR EACH ROW EXECUTE FUNCTION cleanup_deleted_domain()
+            """
+        )
+    except Exception as exc:
+        print(
+            "[datastore] Skipping optional cleanup trigger "
+            f"(not supported by this database): {exc}"
+        )
     print("[datastore] Meta-table 'datastore_schemas' ready (PostgreSQL).")
     _schemas_table_ready = True
 
