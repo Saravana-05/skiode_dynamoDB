@@ -579,12 +579,40 @@ async def insert_row(table_name: str, request: Request, body: dict[str, Any] = B
 
 # ── 3. List all rows ───────────────────────────────────────────
 
+def _filter_rows_by_query(rows: list[dict], params) -> list[dict]:
+    """Keep rows whose column equals the query-string value.
+
+    - ?col=a            -> col == "a"
+    - ?col=a&col=b      -> col in ("a", "b")   (repeat the key for "any of")
+    - Compared as text (ids and numbers come back as strings from the API).
+    - Names that are not a column of the returned rows are ignored, so unknown
+      params (cache-busters, typos) behave as before: nothing is filtered.
+    - Empty values are ignored.
+    """
+    if not rows:
+        return rows
+    columns = set(rows[0].keys())
+    wanted: dict[str, set[str]] = {}
+    for key, value in params:
+        if key in columns and value != "":
+            wanted.setdefault(key, set()).add(value)
+    if not wanted:
+        return rows
+    return [
+        row for row in rows
+        if all(str(row.get(col)) in values for col, values in wanted.items())
+    ]
+
+
 @router.get("/{table_name}/rows", dependencies=[Depends(require_permission("view"))], summary="List all rows in a dynamic table")
 @handle_errors
 async def list_rows(table_name: str, request: Request):
     from ..db.repositories.datastore_repo import list_rows as _list
     rows = await _list(table_name)
     rows = await _apply_field_rules(request, table_name, rows)
+    # Optional column filters: GET /datastore/Department/rows?departmentName=BIO
+    # Applied AFTER field rules so only columns the caller may see can be filtered on.
+    rows = _filter_rows_by_query(rows, request.query_params.multi_items())
     return {"status": "success", "table_name": table_name, "count": len(rows), "data": rows}
 
 
