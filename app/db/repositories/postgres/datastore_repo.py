@@ -916,6 +916,12 @@ async def delete_domain(table_name: str, drop_table: bool = True) -> dict:
         if not existing:
             return {"status": "error", "code": 404, "message": f"Domain '{table_name}' not found"}
 
+        # Check for the optional relationships table OUTSIDE the transaction.
+        # A fetchval/fetchrow inside it leaves a suspended portal open, and
+        # CockroachDB then rejects the next statement ("multiple active portals").
+        _rel = await fetchrow("SELECT to_regclass('domain_relationships') AS t")
+        has_relationships = bool(_rel and _rel["t"])
+
         pool = await ensure_pool()
         async with pool.acquire() as conn:
             async with conn.transaction():
@@ -923,7 +929,7 @@ async def delete_domain(table_name: str, drop_table: bool = True) -> dict:
                 attrs = await conn.execute(
                     "DELETE FROM domain_attributes WHERE dmo_name = $1", table_name
                 )
-                if await conn.fetchval("SELECT to_regclass('domain_relationships')"):
+                if has_relationships:
                     await conn.execute(
                         "DELETE FROM domain_relationships WHERE from_dmo = $1 OR to_dmo = $1",
                         table_name,
