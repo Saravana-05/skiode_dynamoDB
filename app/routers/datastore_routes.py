@@ -208,6 +208,9 @@ class SchemaField(BaseModel):
 
 class CreateTableRequest(BaseModel):
     table_name: str
+    # Business name as the user typed it (e.g. "Client Details") — table_name
+    # stays the storage name (e.g. "ClientDetails"). Optional.
+    label: str | None = None
     schema: list[SchemaField]
     project_id: str | int | None = None   # optional — scopes this domain model to a project
     module_id: str | int | None = None    # optional — places it in a module of that project
@@ -237,6 +240,7 @@ class DraftTableSpec(BaseModel):
     same shape POST /datastore/create takes, just stored instead of
     executed."""
     table_name: str
+    label: str | None = None
     schema: list[SchemaField]
     db_backend: str | None = None
     versioned: bool = False
@@ -353,6 +357,7 @@ async def create_table(body: CreateTableRequest, request: Request):
                 "domain_name": body.table_name,
                 "tables": [{
                     "table_name": body.table_name,
+                    "label":      body.label,
                     "schema":     schema,
                     "project_id": project_id,
                     "module_id":  module_id,
@@ -375,7 +380,7 @@ async def create_table(body: CreateTableRequest, request: Request):
     result = await create_table_from_schema(body.table_name, schema)
 
     # 2. Save / update schema metadata
-    await save_schema(body.table_name, schema, project_id, module_id)
+    await save_schema(body.table_name, schema, project_id, module_id, body.label)
 
     action = "created" if result["created"] else "already existed"
 
@@ -390,6 +395,7 @@ async def create_table(body: CreateTableRequest, request: Request):
     return {
         "status":        "success",
         "table_name":    body.table_name,
+        "label":         body.label,
         "table_created": result["created"],
         "action":        action,
         "db_backend":    settings.DB_BACKEND,
@@ -690,6 +696,7 @@ async def get_schema_route(table_name: str, request: Request):
     return {
         "status":     "success",
         "table_name": table_name,
+        "label":      schema_result.get("label") if isinstance(schema_result, dict) else None,
         "schema":     schema_list,
         "db_backend": db_backend,
     }
@@ -699,6 +706,8 @@ async def get_schema_route(table_name: str, request: Request):
 
 class RenameDomainRequest(BaseModel):
     new_table_name: str | None = None
+    # Send label (empty string / null clears it) to change the business name.
+    label: str | None = None
     # Send project_id / module_id (null clears them) to move the domain.
     project_id: str | int | None = None
     module_id: str | int | None = None
@@ -726,7 +735,11 @@ async def update_domain_route(table_name: str, body: RenameDomainRequest, reques
     project_id, module_id = body.project_id, body.module_id
     if move:
         project_id, module_id = await _resolve_scope(project_id, module_id)
-    result = await _rename(table_name, body.new_table_name or table_name, project_id, module_id, move)
+    update_label = "label" in fields_sent
+    result = await _rename(
+        table_name, body.new_table_name or table_name, project_id, module_id, move,
+        body.label, update_label,
+    )
     _raise_if_error(result)
     # Keep the domain's ABAC rules attached if the domain model was renamed.
     new_name = body.new_table_name or table_name

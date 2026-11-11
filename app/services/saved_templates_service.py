@@ -46,3 +46,21 @@ class SavedTemplatesService:
     async def delete_template(self, template_id: int):
         await execute(st_q["delete_saved_template"], template_id)
         return True
+
+    async def update_template(self, template_id: int, data: dict):
+        """Overwrite an existing template in place (same id, same row) so the
+        Saved Blocks list shows the edited version instead of a duplicate.
+        Returns None when the id doesn't exist."""
+        instance = data.get("instance")
+        row = await fetchrow(
+            st_q["update_saved_template"],
+            template_id,
+            data.get("name"),
+            data.get("plugin_id"),
+            to_jsonb(instance) if instance is not None else None,
+        )
+        if not row:
+            return None
+        result = dict(row)
+        result["instance"] = from_jsonb(result.get("instance"))
+        return result
