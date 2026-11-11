@@ -18,6 +18,12 @@ class CreateSavedTemplateRequest(BaseModel):
     created_by: Optional[str] = None
 
 
+class UpdateSavedTemplateRequest(BaseModel):
+    name: Optional[str] = None
+    plugin_id: Optional[str] = None
+    instance: Optional[Dict[str, Any]] = None
+
+
 @router.get("/")
 async def list_templates():
     try:
@@ -41,5 +47,18 @@ async def delete_template(id: int):
     try:
         await saved_templates_service.delete_template(id)
         return success_response({"message": "Template deleted"})
+    except Exception as e:
+        return JSONResponse(content=error_response(str(e)), status_code=400)
+
+
+@router.put("/{id}")
+async def update_template(id: int, payload: UpdateSavedTemplateRequest):
+    try:
+        result = await saved_templates_service.update_template(
+            id, payload.model_dump(exclude_none=True)
+        )
+        if result is None:
+            return JSONResponse(content=error_response("Template not found"), status_code=404)
+        return success_response(result)
     except Exception as e:
         return JSONResponse(content=error_response(str(e)), status_code=400)

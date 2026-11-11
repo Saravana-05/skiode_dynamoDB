@@ -268,6 +268,7 @@ async def submit_draft(draft_id: int | str) -> dict:
                 table_name, schema,
                 spec.get("project_id", project_id),
                 spec.get("module_id", module_id),
+                spec.get("label"),
             )
             results.append({
                 "table_name": table_name,

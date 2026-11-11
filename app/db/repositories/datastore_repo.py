@@ -27,11 +27,13 @@ async def save_schema(
     schema: list,
     project_id: int | str | None = None,
     module_id: int | str | None = None,
+    label: str | None = None,
 ) -> None:
-    # project_id / module_id (Projects + Modules) are currently PostgreSQL-only.
+    # project_id / module_id / label (Projects + Modules + business label)
+    # are currently PostgreSQL-only.
     if _backend == "dynamodb":
         return await _repo().save_schema(table_name, schema)
-    return await _repo().save_schema(table_name, schema, project_id, module_id)
+    return await _repo().save_schema(table_name, schema, project_id, module_id, label)
 
 
 async def get_schema(table_name: str) -> list | None:
@@ -139,9 +141,9 @@ async def delete_domain(table_name: str, drop_table: bool = True) -> dict:
     return await _f(table_name, drop_table)
 
 
-async def rename_domain(old_name: str, new_name: str, project_id=None, module_id=None, move_scope: bool = False) -> dict:
+async def rename_domain(old_name: str, new_name: str, project_id=None, module_id=None, move_scope: bool = False, label=None, update_label: bool = False) -> dict:
     from .postgres.datastore_repo import rename_domain as _f
-    return await _f(old_name, new_name, project_id, module_id, move_scope)
+    return await _f(old_name, new_name, project_id, module_id, move_scope, label, update_label)
 
 
 async def delete_field(table_name: str, field_id: str) -> dict:

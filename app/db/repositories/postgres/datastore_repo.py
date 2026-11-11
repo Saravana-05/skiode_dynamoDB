@@ -72,6 +72,12 @@ async def _ensure_datastore_schemas_table() -> None:
     await execute(
         "ALTER TABLE datastore_schemas ADD COLUMN IF NOT EXISTS module_id INTEGER"
     )
+    # Business label — the human-friendly name the user typed for the domain
+    # model (e.g. "Client Details") while table_name keeps the storage name
+    # (e.g. "ClientDetails"). Nullable so pre-existing domain models stay valid.
+    await execute(
+        "ALTER TABLE datastore_schemas ADD COLUMN IF NOT EXISTS label VARCHAR"
+    )
     # Safety net: whenever a domain model row disappears from
     # datastore_schemas (API delete, manual DELETE in DBeaver, a script...),
     # Postgres itself removes its attributes (attribute_translations cascade
@@ -126,6 +132,7 @@ async def save_schema(
     schema: list,
     project_id: int | str | None = None,
     module_id: int | str | None = None,
+    label: str | None = None,
 ) -> None:
     await _ensure_datastore_schemas_table()
     now = datetime.now(timezone.utc).isoformat()
@@ -135,29 +142,34 @@ async def save_schema(
     # the domain model from the project it already belongs to.
     await execute(
         """
-        INSERT INTO datastore_schemas (table_name, schema, created_at, project_id, module_id)
-        VALUES ($1, $2, $3, $4, $5)
+        INSERT INTO datastore_schemas (table_name, schema, created_at, project_id, module_id, label)
+        VALUES ($1, $2, $3, $4, $5, $6)
         ON CONFLICT (table_name) DO UPDATE
             SET schema = EXCLUDED.schema,
                 created_at = EXCLUDED.created_at,
                 project_id = COALESCE(EXCLUDED.project_id, datastore_schemas.project_id),
-                module_id  = COALESCE(EXCLUDED.module_id,  datastore_schemas.module_id)
+                module_id  = COALESCE(EXCLUDED.module_id,  datastore_schemas.module_id),
+                -- Same rule as project_id: a plain re-save that sends no
+                -- label must not wipe the label that was typed earlier.
+                label      = COALESCE(EXCLUDED.label,      datastore_schemas.label)
         """,
         table_name, json.dumps(schema), now,
         int(project_id) if project_id is not None else None,
         int(module_id) if module_id is not None else None,
+        (label.strip() or None) if isinstance(label, str) else None,
     )
 
 
 async def get_schema(table_name: str) -> dict | None:
     await _ensure_datastore_schemas_table()
     row = await fetchrow(
-        "SELECT schema, project_id, module_id FROM datastore_schemas WHERE table_name = $1", table_name
+        "SELECT schema, project_id, module_id, label FROM datastore_schemas WHERE table_name = $1", table_name
     )
     if not row:
         return None
     return {
         "schema":     json.loads(row["schema"]),
+        "label":      row["label"],
         "db_backend": "postgresql",
         "project_id": str(row["project_id"]) if row["project_id"] is not None else None,
         "module_id":  str(row["module_id"]) if row["module_id"] is not None else None,
@@ -178,13 +190,14 @@ async def list_schemas(
         clauses.append(f"module_id = ${len(args)}")
     where = f"WHERE {' AND '.join(clauses)} " if clauses else ""
     rows = await fetch(
-        "SELECT table_name, schema, created_at, project_id, module_id FROM datastore_schemas "
+        "SELECT table_name, schema, created_at, project_id, module_id, label FROM datastore_schemas "
         f"{where}ORDER BY created_at DESC",
         *args,
     )
     return [
         {
             "table_name": r["table_name"],
+            "label":      r["label"],
             "schema":     json.loads(r["schema"]),
             "created_at": str(r["created_at"]) if r["created_at"] else None,
             "db_backend": "postgresql",
@@ -971,9 +984,12 @@ async def rename_domain(
     project_id: int | str | None = None,
     module_id: int | str | None = None,
     move_scope: bool = False,
+    label: str | None = None,
+    update_label: bool = False,
 ) -> dict:
     """Rename a domain model (table + schema row + attribute rows) and/or
-    move it to another project/module (move_scope=True; None clears)."""
+    move it to another project/module (move_scope=True; None clears) and/or
+    change its business label (update_label=True; empty/None clears)."""
     try:
         _check_ident(old_name, "table name")
         _check_ident(new_name, "new table name")
@@ -999,6 +1015,12 @@ async def rename_domain(
                 int(project_id) if project_id not in (None, "") else None,
                 int(module_id) if module_id not in (None, "") else None,
                 new_name,
+            )
+        if update_label:
+            clean = label.strip() if isinstance(label, str) else ""
+            await execute(
+                "UPDATE datastore_schemas SET label = $1 WHERE table_name = $2",
+                clean or None, new_name,
             )
         return {"status": "success", "table_name": new_name, "old_name": old_name}
     except Exception as e:
