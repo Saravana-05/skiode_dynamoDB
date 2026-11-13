@@ -72,55 +72,6 @@ async def _ensure_datastore_schemas_table() -> None:
     await execute(
         "ALTER TABLE datastore_schemas ADD COLUMN IF NOT EXISTS module_id INTEGER"
     )
-    # Business label — the human-friendly name the user typed for the domain
-    # model (e.g. "Client Details") while table_name keeps the storage name
-    # (e.g. "ClientDetails"). Nullable so pre-existing domain models stay valid.
-    await execute(
-        "ALTER TABLE datastore_schemas ADD COLUMN IF NOT EXISTS label VARCHAR"
-    )
-    # Safety net: whenever a domain model row disappears from
-    # datastore_schemas (API delete, manual DELETE in DBeaver, a script...),
-    # Postgres itself removes its attributes (attribute_translations cascade
-    # from domain_attributes via FK) and its relationships. No code path can
-    # forget to clean up.
-    #
-    # NOTE: this trigger is OPTIONAL. Some PostgreSQL-compatible backends
-    # (e.g. CockroachDB) reject the PL/pgSQL function body ("no data source
-    # matches prefix: old"). If that happens we must NOT fail every request
-    # that touches datastore_schemas, so any error here is logged and
-    # skipped. delete_domain() already removes attributes and relationships
-    # explicitly inside its own transaction, so the API delete path stays
-    # correct without the trigger.
-    try:
-        await execute(
-            """
-            CREATE OR REPLACE FUNCTION cleanup_deleted_domain() RETURNS trigger AS $$
-            BEGIN
-                IF to_regclass('domain_attributes') IS NOT NULL THEN
-                    DELETE FROM domain_attributes WHERE dmo_name = OLD.table_name;
-                END IF;
-                IF to_regclass('domain_relationships') IS NOT NULL THEN
-                    DELETE FROM domain_relationships
-                    WHERE from_dmo = OLD.table_name OR to_dmo = OLD.table_name;
-                END IF;
-                RETURN OLD;
-            END;
-            $$ LANGUAGE plpgsql
-            """
-        )
-        await execute("DROP TRIGGER IF EXISTS trg_cleanup_deleted_domain ON datastore_schemas")
-        await execute(
-            """
-            CREATE TRIGGER trg_cleanup_deleted_domain
-            AFTER DELETE ON datastore_schemas
-            FOR EACH ROW EXECUTE FUNCTION cleanup_deleted_domain()
-            """
-        )
-    except Exception as exc:
-        print(
-            "[datastore] Skipping optional cleanup trigger "
-            f"(not supported by this database): {exc}"
-        )
     print("[datastore] Meta-table 'datastore_schemas' ready (PostgreSQL).")
     _schemas_table_ready = True
 
@@ -132,7 +83,6 @@ async def save_schema(
     schema: list,
     project_id: int | str | None = None,
     module_id: int | str | None = None,
-    label: str | None = None,
 ) -> None:
     await _ensure_datastore_schemas_table()
     now = datetime.now(timezone.utc).isoformat()
@@ -142,34 +92,29 @@ async def save_schema(
     # the domain model from the project it already belongs to.
     await execute(
         """
-        INSERT INTO datastore_schemas (table_name, schema, created_at, project_id, module_id, label)
-        VALUES ($1, $2, $3, $4, $5, $6)
+        INSERT INTO datastore_schemas (table_name, schema, created_at, project_id, module_id)
+        VALUES ($1, $2, $3, $4, $5)
         ON CONFLICT (table_name) DO UPDATE
             SET schema = EXCLUDED.schema,
                 created_at = EXCLUDED.created_at,
                 project_id = COALESCE(EXCLUDED.project_id, datastore_schemas.project_id),
-                module_id  = COALESCE(EXCLUDED.module_id,  datastore_schemas.module_id),
-                -- Same rule as project_id: a plain re-save that sends no
-                -- label must not wipe the label that was typed earlier.
-                label      = COALESCE(EXCLUDED.label,      datastore_schemas.label)
+                module_id  = COALESCE(EXCLUDED.module_id,  datastore_schemas.module_id)
         """,
         table_name, json.dumps(schema), now,
         int(project_id) if project_id is not None else None,
         int(module_id) if module_id is not None else None,
-        (label.strip() or None) if isinstance(label, str) else None,
     )
 
 
 async def get_schema(table_name: str) -> dict | None:
     await _ensure_datastore_schemas_table()
     row = await fetchrow(
-        "SELECT schema, project_id, module_id, label FROM datastore_schemas WHERE table_name = $1", table_name
+        "SELECT schema, project_id, module_id FROM datastore_schemas WHERE table_name = $1", table_name
     )
     if not row:
         return None
     return {
         "schema":     json.loads(row["schema"]),
-        "label":      row["label"],
         "db_backend": "postgresql",
         "project_id": str(row["project_id"]) if row["project_id"] is not None else None,
         "module_id":  str(row["module_id"]) if row["module_id"] is not None else None,
@@ -190,14 +135,13 @@ async def list_schemas(
         clauses.append(f"module_id = ${len(args)}")
     where = f"WHERE {' AND '.join(clauses)} " if clauses else ""
     rows = await fetch(
-        "SELECT table_name, schema, created_at, project_id, module_id, label FROM datastore_schemas "
+        "SELECT table_name, schema, created_at, project_id, module_id FROM datastore_schemas "
         f"{where}ORDER BY created_at DESC",
         *args,
     )
     return [
         {
             "table_name": r["table_name"],
-            "label":      r["label"],
             "schema":     json.loads(r["schema"]),
             "created_at": str(r["created_at"]) if r["created_at"] else None,
             "db_backend": "postgresql",
@@ -467,26 +411,6 @@ async def delete_row(table_name: str, record_id: str) -> dict:
             now, int(record_id)
         )
     return {"status": "success", "record_id": record_id}
-
-
-async def restore_row(table_name: str, record_id: str) -> dict:
-    """Undo delete_row: clear deleted_at so the archived row is active again."""
-    try:
-        _check_ident(table_name, "table name")
-        pool = await ensure_pool()
-        async with pool.acquire() as conn:
-            result = await conn.execute(
-                f'UPDATE "{table_name}" SET deleted_at = NULL '
-                f'WHERE id = $1 AND deleted_at IS NOT NULL',
-                int(record_id),
-            )
-        # asyncpg returns a command tag such as "UPDATE 1"
-        if result.endswith(" 0"):
-            return {"status": "error", "code": 404,
-                    "message": f"No archived record {record_id} found in '{table_name}'"}
-        return {"status": "success", "record_id": record_id}
-    except Exception as e:
-        return {"status": "error", "code": 400, "message": str(e)}
 
 
 # ════════════════════════════════════════════════════════════════════════
@@ -914,68 +838,28 @@ def _check_ident(name: str, what: str) -> str:
 
 
 async def delete_domain(table_name: str, drop_table: bool = True) -> dict:
-    """Remove a domain model: its schema row, its attribute rows (translations
-    cascade from them), its relationships, and (by default) the physical table
-    with all its data. Everything runs in ONE transaction, so a failure part-way
-    leaves nothing half-deleted."""
+    """Remove a domain model: its schema row, its attribute/translation
+    rows, and (by default) the physical table with all its data."""
     try:
         _check_ident(table_name, "table name")
         await _ensure_datastore_schemas_table()
-        await _ensure_domain_attributes_table()
-        await _ensure_attribute_translations_table()   # translations cascade from attributes
         existing = await fetchrow(
             "SELECT 1 FROM datastore_schemas WHERE table_name = $1", table_name
         )
         if not existing:
             return {"status": "error", "code": 404, "message": f"Domain '{table_name}' not found"}
 
-        # Check for the optional relationships table OUTSIDE the transaction.
-        # A fetchval/fetchrow inside it leaves a suspended portal open, and
-        # CockroachDB then rejects the next statement ("multiple active portals").
-        _rel = await fetchrow("SELECT to_regclass('domain_relationships') AS t")
-        has_relationships = bool(_rel and _rel["t"])
+        if drop_table:
+            await execute(f'DROP TABLE IF EXISTS "{table_name}"')
+        await execute("DELETE FROM datastore_schemas WHERE table_name = $1", table_name)
 
-        pool = await ensure_pool()
-        async with pool.acquire() as conn:
-            async with conn.transaction():
-                # Attributes first (attribute_translations ON DELETE CASCADE).
-                attrs = await conn.execute(
-                    "DELETE FROM domain_attributes WHERE dmo_name = $1", table_name
-                )
-                if has_relationships:
-                    await conn.execute(
-                        "DELETE FROM domain_relationships WHERE from_dmo = $1 OR to_dmo = $1",
-                        table_name,
-                    )
-                await conn.execute("DELETE FROM datastore_schemas WHERE table_name = $1", table_name)
-                if drop_table:
-                    await conn.execute(f'DROP TABLE IF EXISTS "{table_name}"')
-        print(f"[datastore] Domain '{table_name}' deleted with its attributes "
-              f"({attrs}); drop_table={drop_table}.")
+        await _ensure_domain_attributes_table()
+        await _ensure_attribute_translations_table()   # translations cascade from attributes
+        await execute("DELETE FROM domain_attributes WHERE dmo_name = $1", table_name)
+        print(f"[datastore] Domain '{table_name}' deleted (drop_table={drop_table}).")
         return {"status": "success", "table_name": table_name, "table_dropped": drop_table}
     except Exception as e:
         return {"status": "error", "code": 400, "message": str(e)}
-
-
-async def purge_orphan_attributes() -> dict:
-    """One-off cleanup: delete domain_attributes (and their translations) whose
-    domain no longer exists in datastore_schemas, plus dangling relationships.
-    Safe to call any time (e.g. from an admin route)."""
-    await _ensure_datastore_schemas_table()
-    await _ensure_domain_attributes_table()
-    await _ensure_attribute_translations_table()
-    attrs = await execute(
-        "DELETE FROM domain_attributes WHERE dmo_name NOT IN (SELECT table_name FROM datastore_schemas)"
-    )
-    rels = "DELETE 0"
-    _rel = await fetchrow("SELECT to_regclass('domain_relationships') AS t")
-    if _rel and _rel["t"]:
-        rels = await execute(
-            "DELETE FROM domain_relationships "
-            "WHERE from_dmo NOT IN (SELECT table_name FROM datastore_schemas) "
-            "OR to_dmo NOT IN (SELECT table_name FROM datastore_schemas)"
-        )
-    return {"status": "success", "attributes_removed": attrs, "relationships_removed": rels}
 
 
 async def rename_domain(
@@ -984,12 +868,9 @@ async def rename_domain(
     project_id: int | str | None = None,
     module_id: int | str | None = None,
     move_scope: bool = False,
-    label: str | None = None,
-    update_label: bool = False,
 ) -> dict:
     """Rename a domain model (table + schema row + attribute rows) and/or
-    move it to another project/module (move_scope=True; None clears) and/or
-    change its business label (update_label=True; empty/None clears)."""
+    move it to another project/module (move_scope=True; None clears)."""
     try:
         _check_ident(old_name, "table name")
         _check_ident(new_name, "new table name")
@@ -1004,10 +885,6 @@ async def rename_domain(
             await execute("UPDATE datastore_schemas SET table_name = $1 WHERE table_name = $2", new_name, old_name)
             await _ensure_domain_attributes_table()
             await execute("UPDATE domain_attributes SET dmo_name = $1 WHERE dmo_name = $2", new_name, old_name)
-            _rel = await fetchrow("SELECT to_regclass('domain_relationships') AS t")
-            if _rel and _rel["t"]:
-                await execute("UPDATE domain_relationships SET from_dmo = $1 WHERE from_dmo = $2", new_name, old_name)
-                await execute("UPDATE domain_relationships SET to_dmo = $1 WHERE to_dmo = $2", new_name, old_name)
 
         if move_scope:
             await execute(
@@ -1015,12 +892,6 @@ async def rename_domain(
                 int(project_id) if project_id not in (None, "") else None,
                 int(module_id) if module_id not in (None, "") else None,
                 new_name,
-            )
-        if update_label:
-            clean = label.strip() if isinstance(label, str) else ""
-            await execute(
-                "UPDATE datastore_schemas SET label = $1 WHERE table_name = $2",
-                clean or None, new_name,
             )
         return {"status": "success", "table_name": new_name, "old_name": old_name}
     except Exception as e:

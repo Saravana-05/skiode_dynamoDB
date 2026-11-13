@@ -208,9 +208,6 @@ class SchemaField(BaseModel):
 
 class CreateTableRequest(BaseModel):
     table_name: str
-    # Business name as the user typed it (e.g. "Client Details") — table_name
-    # stays the storage name (e.g. "ClientDetails"). Optional.
-    label: str | None = None
     schema: list[SchemaField]
     project_id: str | int | None = None   # optional — scopes this domain model to a project
     module_id: str | int | None = None    # optional — places it in a module of that project
@@ -240,7 +237,6 @@ class DraftTableSpec(BaseModel):
     same shape POST /datastore/create takes, just stored instead of
     executed."""
     table_name: str
-    label: str | None = None
     schema: list[SchemaField]
     db_backend: str | None = None
     versioned: bool = False
@@ -357,7 +353,6 @@ async def create_table(body: CreateTableRequest, request: Request):
                 "domain_name": body.table_name,
                 "tables": [{
                     "table_name": body.table_name,
-                    "label":      body.label,
                     "schema":     schema,
                     "project_id": project_id,
                     "module_id":  module_id,
@@ -380,7 +375,7 @@ async def create_table(body: CreateTableRequest, request: Request):
     result = await create_table_from_schema(body.table_name, schema)
 
     # 2. Save / update schema metadata
-    await save_schema(body.table_name, schema, project_id, module_id, body.label)
+    await save_schema(body.table_name, schema, project_id, module_id)
 
     action = "created" if result["created"] else "already existed"
 
@@ -395,7 +390,6 @@ async def create_table(body: CreateTableRequest, request: Request):
     return {
         "status":        "success",
         "table_name":    body.table_name,
-        "label":         body.label,
         "table_created": result["created"],
         "action":        action,
         "db_backend":    settings.DB_BACKEND,
@@ -585,40 +579,12 @@ async def insert_row(table_name: str, request: Request, body: dict[str, Any] = B
 
 # ── 3. List all rows ───────────────────────────────────────────
 
-def _filter_rows_by_query(rows: list[dict], params) -> list[dict]:
-    """Keep rows whose column equals the query-string value.
-
-    - ?col=a            -> col == "a"
-    - ?col=a&col=b      -> col in ("a", "b")   (repeat the key for "any of")
-    - Compared as text (ids and numbers come back as strings from the API).
-    - Names that are not a column of the returned rows are ignored, so unknown
-      params (cache-busters, typos) behave as before: nothing is filtered.
-    - Empty values are ignored.
-    """
-    if not rows:
-        return rows
-    columns = set(rows[0].keys())
-    wanted: dict[str, set[str]] = {}
-    for key, value in params:
-        if key in columns and value != "":
-            wanted.setdefault(key, set()).add(value)
-    if not wanted:
-        return rows
-    return [
-        row for row in rows
-        if all(str(row.get(col)) in values for col, values in wanted.items())
-    ]
-
-
 @router.get("/{table_name}/rows", dependencies=[Depends(require_permission("view"))], summary="List all rows in a dynamic table")
 @handle_errors
 async def list_rows(table_name: str, request: Request):
     from ..db.repositories.datastore_repo import list_rows as _list
     rows = await _list(table_name)
     rows = await _apply_field_rules(request, table_name, rows)
-    # Optional column filters: GET /datastore/Department/rows?departmentName=BIO
-    # Applied AFTER field rules so only columns the caller may see can be filtered on.
-    rows = _filter_rows_by_query(rows, request.query_params.multi_items())
     return {"status": "success", "table_name": table_name, "count": len(rows), "data": rows}
 
 
@@ -696,7 +662,6 @@ async def get_schema_route(table_name: str, request: Request):
     return {
         "status":     "success",
         "table_name": table_name,
-        "label":      schema_result.get("label") if isinstance(schema_result, dict) else None,
         "schema":     schema_list,
         "db_backend": db_backend,
     }
@@ -706,8 +671,6 @@ async def get_schema_route(table_name: str, request: Request):
 
 class RenameDomainRequest(BaseModel):
     new_table_name: str | None = None
-    # Send label (empty string / null clears it) to change the business name.
-    label: str | None = None
     # Send project_id / module_id (null clears them) to move the domain.
     project_id: str | int | None = None
     module_id: str | int | None = None
@@ -735,11 +698,7 @@ async def update_domain_route(table_name: str, body: RenameDomainRequest, reques
     project_id, module_id = body.project_id, body.module_id
     if move:
         project_id, module_id = await _resolve_scope(project_id, module_id)
-    update_label = "label" in fields_sent
-    result = await _rename(
-        table_name, body.new_table_name or table_name, project_id, module_id, move,
-        body.label, update_label,
-    )
+    result = await _rename(table_name, body.new_table_name or table_name, project_id, module_id, move)
     _raise_if_error(result)
     # Keep the domain's ABAC rules attached if the domain model was renamed.
     new_name = body.new_table_name or table_name
@@ -803,19 +762,7 @@ async def delete_row(table_name: str, record_id: str, request: Request):
     return {"status": "success", "record_id": record_id}
 
 
-# ── 8b. Restore an archived row ────────────────────────────────
-
-@router.post("/{table_name}/row/{record_id}/restore", dependencies=[Depends(require_permission("edit"))], summary="Restore an archived (soft-deleted) row")
-@handle_errors
-async def restore_row_route(table_name: str, record_id: str, request: Request):
-    from ..db.repositories.datastore_repo import restore_row as _restore
-    result = await _restore(table_name, record_id)
-    if result.get("status") == "error":
-        raise HTTPException(status_code=result.get("code", 400), detail=result.get("message", "Restore failed"))
-    return {"status": "success", "record_id": record_id}
-
-
-# ── 9. List archived rows ──------------------------------------
+# ── 9. List archived rows ──────────────────────────────────────
 
 @router.get("/{table_name}/archived", dependencies=[Depends(require_permission("view"))], summary="List soft-deleted (archived) rows")
 @handle_errors
