@@ -260,12 +260,13 @@ async def submit_draft(draft_id: int | str) -> dict:
     for spec in tables:
         table_name = spec.get("table_name")
         schema     = spec.get("schema") or []
+        metadata_schema = spec.get("metadata_schema") or schema
         if not table_name:
             continue
         try:
             created = await create_table_from_schema(table_name, schema)
             await save_schema(
-                table_name, schema,
+                table_name, metadata_schema,
                 spec.get("project_id", project_id),
                 spec.get("module_id", module_id),
                 spec.get("label"),

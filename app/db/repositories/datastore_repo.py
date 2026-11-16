@@ -58,6 +58,22 @@ async def insert_row(table_name: str, schema: list, row_data: dict) -> str:
     return await _repo().insert_row(table_name, schema, row_data)
 
 
+async def insert_row_with_links(
+    table_name: str,
+    schema: list,
+    row_data: dict,
+    junction_table: str,
+    link_fields: list[dict],
+) -> str:
+    return await _repo().insert_row_with_links(
+        table_name, schema, row_data, junction_table, link_fields
+    )
+
+
+async def replace_multi_link_rows(table_name: str, schema: list, rows: list[dict]) -> None:
+    return await _repo().replace_multi_link_rows(table_name, schema, rows)
+
+
 async def list_rows(table_name: str) -> list[dict]:
     return await _repo().list_rows(table_name)
 

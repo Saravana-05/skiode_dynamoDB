@@ -13,6 +13,7 @@ PostgreSQL implementation of the dynamic datastore repo.
 import json
 
 from datetime import datetime, timezone
+import re
 from ....core.database import execute, fetch, fetchrow, ensure_pool
 
 
@@ -329,6 +330,114 @@ async def insert_row(table_name: str, schema: list, row_data: dict) -> str:
             *vals
         )
     return str(record_id)
+
+
+async def insert_row_with_links(
+    table_name: str,
+    schema: list,
+    row_data: dict,
+    junction_table: str,
+    link_fields: list[dict],
+) -> str:
+    """Insert a row and its combined multi-link association atomically."""
+    identifiers = [table_name, junction_table]
+    identifiers.extend(field["target_domain"] for field in link_fields)
+    if any(not re.fullmatch(r"[A-Za-z_][A-Za-z0-9_]*", name) for name in identifiers):
+        raise ValueError("Invalid identifier in multi-link schema")
+
+    source_id_field = f"{table_name}Id"
+    target_ids = []
+    for field in link_fields:
+        target = field["target_domain"]
+        value = row_data.get(field["field_id"])
+        if value is None or str(value).strip() == "":
+            raise ValueError(f"'{field.get('label') or field['field_id']}' is required for this multi-link")
+        target_ids.append((target, str(value)))
+
+    now = datetime.now(timezone.utc).isoformat()
+    cols = ["created_at"]
+    vals: list = [now]
+    for field in schema:
+        fid = field["field_id"]
+        value = row_data.get(fid)
+        if value is None:
+            value = field.get("value")
+        if field.get("type") == "number" and value is not None:
+            value = float(value)
+        elif field.get("type") == "boolean" and value is not None:
+            value = bool(value)
+        elif value is not None:
+            value = str(value)
+        cols.append(fid)
+        vals.append(value)
+
+    col_sql = ", ".join(f'"{col}"' for col in cols)
+    value_sql = ", ".join(f"${index}" for index in range(1, len(vals) + 1))
+    pool = await ensure_pool()
+    async with pool.acquire() as conn:
+        async with conn.transaction():
+            record_id = await conn.fetchval(
+                f'INSERT INTO "{table_name}" ({col_sql}) VALUES ({value_sql}) RETURNING id',
+                *vals,
+            )
+            for target, target_id in target_ids:
+                exists = await conn.fetchval(
+                    f'SELECT EXISTS (SELECT 1 FROM "{target}" WHERE id::text = $1 AND deleted_at IS NULL)',
+                    target_id,
+                )
+                if not exists:
+                    raise ValueError(f"Record '{target_id}' does not exist in linked domain '{target}'")
+
+            for target, target_id in target_ids:
+                pairwise_table = f"{table_name}_{target}"
+                await conn.execute(
+                    f'INSERT INTO "{pairwise_table}" ("{source_id_field}", "{target}Id") '
+                    "VALUES ($1, $2)",
+                    str(record_id),
+                    target_id,
+                )
+
+            junction_cols = [source_id_field, *(f"{target}Id" for target, _ in target_ids)]
+            junction_vals = [str(record_id), *(target_id for _, target_id in target_ids)]
+            junction_cols_sql = ", ".join(f'"{col}"' for col in junction_cols)
+            junction_values_sql = ", ".join(
+                f"${index}" for index in range(1, len(junction_vals) + 1)
+            )
+            await conn.execute(
+                f'INSERT INTO "{junction_table}" ({junction_cols_sql}) '
+                f'VALUES ({junction_values_sql})',
+                *junction_vals,
+            )
+    return str(record_id)
+
+
+async def replace_multi_link_rows(table_name: str, schema: list, rows: list[dict]) -> None:
+    """Replace derived associative rows in one transaction."""
+    identifiers = [table_name]
+    identifiers.extend(field["field_id"] for field in schema)
+    if any(not re.fullmatch(r"[A-Za-z_][A-Za-z0-9_]*", name) for name in identifiers):
+        raise ValueError("Invalid identifier in multi-link domain schema")
+
+    pool = await ensure_pool()
+    async with pool.acquire() as conn:
+        async with conn.transaction():
+            await conn.execute(f'DELETE FROM "{table_name}"')
+            for row in rows:
+                now = datetime.now(timezone.utc).isoformat()
+                columns = ['"created_at"']
+                values = [now]
+                for field in schema:
+                    field_id = field["field_id"]
+                    value = row.get(field_id)
+                    if value is not None:
+                        columns.append(f'"{field_id}"')
+                        values.append(str(value))
+                placeholders = ", ".join(f"${index}" for index in range(1, len(values) + 1))
+                await conn.execute(
+                    f'INSERT INTO "{table_name}" ({", ".join(columns)}) '
+                    f'VALUES ({placeholders})',
+                    *values,
+                )
 
 
 # ── row queries ─────────────────────────────────────────────────

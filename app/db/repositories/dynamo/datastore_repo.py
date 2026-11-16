@@ -21,7 +21,7 @@ import uuid
 from datetime import datetime, timezone
 from decimal import Decimal
 
-from ....core.database import execute, fetch, fetchrow
+from ....core.database import execute, fetch, fetchrow, ensure_pool
 from ..utils import clean, strip_none
 
 
@@ -277,6 +277,114 @@ async def insert_row(table_name: str, schema: list, row_data: dict) -> str:
     query = f'INSERT INTO "{safe_table}" ({col_list}) VALUES ({placeholders})'
     await execute(query, *values)
     return record_id
+
+
+async def insert_row_with_links(
+    table_name: str,
+    schema: list,
+    row_data: dict,
+    junction_table: str,
+    link_fields: list[dict],
+) -> str:
+    """Insert a row and its combined multi-link association atomically."""
+    identifiers = [table_name, junction_table]
+    identifiers.extend(field["target_domain"] for field in link_fields)
+    if any(not _IDENTIFIER_RE.fullmatch(name) for name in identifiers):
+        raise ValueError("Invalid identifier in multi-link schema")
+
+    target_ids = []
+    source_id_field = f"{table_name}Id"
+    for field in link_fields:
+        target = field["target_domain"]
+        value = row_data.get(field["field_id"])
+        if value is None or str(value).strip() == "":
+            raise ValueError(f"'{field.get('label') or field['field_id']}' is required for this multi-link")
+        target_ids.append((target, str(value)))
+
+    record_id = str(uuid.uuid4())
+    columns = ['"id"', '"created_at"']
+    values = [record_id, datetime.now(timezone.utc)]
+    for field in schema:
+        field_id = field["field_id"]
+        value = row_data.get(field_id)
+        if value is None:
+            value = field.get("value")
+        casted = _cast(value, field)
+        if casted is not None:
+            columns.append(f'"{_safe_identifier(field_id)}"')
+            values.append(casted)
+
+    placeholders = ", ".join(f"${index}" for index in range(1, len(values) + 1))
+    safe_table = _safe_identifier(table_name)
+    safe_junction = _safe_identifier(junction_table)
+    pool = await ensure_pool()
+    async with pool.acquire() as conn:
+        async with conn.transaction():
+            await conn.execute(
+                f'INSERT INTO "{safe_table}" ({", ".join(columns)}) VALUES ({placeholders})',
+                *values,
+            )
+            for target, target_id in target_ids:
+                exists = await conn.fetchval(
+                    f'SELECT EXISTS (SELECT 1 FROM "{_safe_identifier(target)}" '
+                    'WHERE id::text = $1 AND deleted_at IS NULL)',
+                    target_id,
+                )
+                if not exists:
+                    raise ValueError(f"Record '{target_id}' does not exist in linked domain '{target}'")
+
+            for target, target_id in target_ids:
+                pairwise_table = _safe_identifier(f"{table_name}_{target}")
+                target_column = _safe_identifier(f"{target}Id")
+                await conn.execute(
+                    f'INSERT INTO "{pairwise_table}" '
+                    f'("{_safe_identifier(source_id_field)}", "{target_column}") '
+                    "VALUES ($1, $2)",
+                    record_id,
+                    target_id,
+                )
+
+            junction_columns = [
+                f'"{_safe_identifier(table_name)}Id"',
+                *(f'"{_safe_identifier(target)}Id"' for target, _ in target_ids),
+            ]
+            junction_values = [record_id, *(target_id for _, target_id in target_ids)]
+            junction_placeholders = ", ".join(
+                f"${index}" for index in range(1, len(junction_values) + 1)
+            )
+            await conn.execute(
+                f'INSERT INTO "{safe_junction}" ({", ".join(junction_columns)}) '
+                f'VALUES ({junction_placeholders})',
+                *junction_values,
+            )
+    return record_id
+
+
+async def replace_multi_link_rows(table_name: str, schema: list, rows: list[dict]) -> None:
+    """Replace derived associative rows in one transaction."""
+    safe_table = _safe_identifier(table_name)
+    safe_fields = [_safe_identifier(field["field_id"]) for field in schema]
+
+    pool = await ensure_pool()
+    async with pool.acquire() as conn:
+        async with conn.transaction():
+            await conn.execute(f'DELETE FROM "{safe_table}"')
+            for row in rows:
+                record_id = str(uuid.uuid4())
+                now = datetime.now(timezone.utc)
+                columns = ['"id"', '"created_at"']
+                values = [record_id, now]
+                for field, safe_field in zip(schema, safe_fields):
+                    value = row.get(field["field_id"])
+                    if value is not None:
+                        columns.append(f'"{safe_field}"')
+                        values.append(str(value))
+                placeholders = ", ".join(f"${index}" for index in range(1, len(values) + 1))
+                await conn.execute(
+                    f'INSERT INTO "{safe_table}" ({", ".join(columns)}) '
+                    f'VALUES ({placeholders})',
+                    *values,
+                )
 
 
 # ── row queries ──────────────────────────────────────────────────

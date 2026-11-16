@@ -324,6 +324,43 @@ def _extract_schema_list(schema_result: Any) -> list[dict]:
     return []
 
 
+async def _attach_multi_link_values(table_name: str, rows: list[dict]) -> list[dict]:
+    """Project combined junction IDs back onto their source-domain fields."""
+    if not rows:
+        return rows
+    from ..db.repositories.datastore_repo import get_schema, list_rows as _list
+
+    schema_result = await get_schema(table_name)
+    schema = _extract_schema_list(schema_result)
+    linked_fields = [field for field in schema if field.get("multi_link") is True]
+    if len(linked_fields) < 2:
+        return rows
+
+    targets = [field.get("target_domain") for field in linked_fields]
+    if any(not isinstance(target, str) or not re.fullmatch(r"[A-Za-z_][A-Za-z0-9_]*", target) for target in targets):
+        return rows
+    junction_name = "_".join([table_name, *targets])
+    if len(junction_name) > 63:
+        return rows
+    if not await get_schema(junction_name):
+        return rows
+
+    junction_rows = await _list(junction_name)
+    source_column = f"{table_name}Id"
+    links_by_source = {
+        str(junction_row.get(source_column)): junction_row
+        for junction_row in junction_rows
+        if junction_row.get(source_column) is not None
+    }
+    for row in rows:
+        junction_row = links_by_source.get(str(row.get("id")))
+        for field in linked_fields:
+            target_column = f"{field['target_domain']}Id"
+            if row.get(field["field_id"]) is None:
+                row[field["field_id"]] = junction_row.get(target_column) if junction_row else None
+    return rows
+
+
 async def _resolve_scope(project_id, module_id):
     """Validate the (project, module) pair; raises an HTTP error if invalid."""
     if module_id in (None, ""):
@@ -340,11 +377,6 @@ async def _multi_link_table_spec(table_name: str, schema: list[dict]) -> dict | 
     linked_fields = [field for field in schema if field.get("multi_link") is True]
     if not linked_fields:
         return None
-    if len(linked_fields) < 2:
-        raise HTTPException(
-            status_code=400,
-            detail="multi_link requires at least two linked-domain fields",
-        )
 
     from ..db.repositories.datastore_repo import get_schema
 
@@ -390,6 +422,12 @@ async def _multi_link_table_spec(table_name: str, schema: list[dict]) -> dict | 
         target_domains.append(target)
         field_ids.add(generated_field_id)
 
+    # A single relationship field can be saved before the second one is
+    # added. Its source column and pairwise junction are still created; the
+    # combined junction is generated once at least two fields are present.
+    if len(linked_fields) < 2:
+        return None
+
     junction_name = "_".join([table_name, *target_domains])
     if len(junction_name) > 63:
         raise HTTPException(
@@ -423,6 +461,240 @@ async def _multi_link_table_spec(table_name: str, schema: list[dict]) -> dict | 
     }
 
 
+def _multi_link_participants(schema: list[dict]) -> list[dict]:
+    return [field for field in schema if field.get("multiLinkDomain") is True]
+
+
+def _join_association_rows(edges: list[dict], participants: list[str]) -> list[dict[str, str]]:
+    """Natural-join pairwise link rows into complete multi-domain tuples."""
+    graph = {participant: set() for participant in participants}
+    for edge in edges:
+        left, right = edge["domains"]
+        graph[left].add(right)
+        graph[right].add(left)
+
+    reached = set()
+    pending = [participants[0]] if participants else []
+    while pending:
+        current = pending.pop()
+        if current in reached:
+            continue
+        reached.add(current)
+        pending.extend(graph[current] - reached)
+    if reached != set(participants):
+        raise HTTPException(
+            status_code=409,
+            detail="Pairwise links do not connect every domain selected for this multi-link domain.",
+        )
+
+    joined: list[dict[str, str]] | None = None
+    available_edges = list(edges)
+    while available_edges:
+        selected_index = 0
+        if joined is not None:
+            joined_domains = set(joined[0]) if joined else set(participants)
+            selected_index = next(
+                (
+                    index for index, edge in enumerate(available_edges)
+                    if joined_domains.intersection(edge["domains"])
+                ),
+                -1,
+            )
+            if selected_index < 0:
+                raise HTTPException(status_code=409, detail="Unable to join the pairwise relationship rows.")
+        edge = available_edges.pop(selected_index)
+        edge_rows = edge["rows"]
+        mapped_rows = [
+            {
+                domain: str(row[field_id])
+                for domain, field_id in edge["fields"].items()
+                if row.get(field_id) is not None
+            }
+            for row in edge_rows
+        ]
+        mapped_rows = [row for row in mapped_rows if len(row) == 2]
+        if joined is None:
+            joined = mapped_rows
+            continue
+        if not joined or not mapped_rows:
+            joined = []
+            continue
+
+        shared_domains = set(joined[0]).intersection(edge["domains"])
+        next_rows = []
+        for existing in joined:
+            for new in mapped_rows:
+                if all(existing.get(domain) == new.get(domain) for domain in shared_domains):
+                    next_rows.append({**existing, **new})
+        joined = next_rows
+
+    if not joined:
+        return []
+
+    unique_rows = {}
+    for row in joined:
+        if set(row) != set(participants):
+            continue
+        key = tuple(row[participant] for participant in participants)
+        unique_rows[key] = row
+    return list(unique_rows.values())
+
+
+async def _sync_multi_link_domains_for_pairwise_table(table_name: str) -> list[dict]:
+    """Rebuild explicit multi-link rows from canonical pairwise link tables."""
+    from ..db.repositories.datastore_repo import (
+        list_rows as _list_rows,
+        list_schemas as _list_schemas,
+        replace_multi_link_rows as _replace_rows,
+    )
+
+    schema_entries = await _list_schemas()
+    parsed_schemas = [
+        {
+            "table_name": entry.get("table_name"),
+            "schema": _extract_schema_list(entry),
+        }
+        for entry in schema_entries
+    ]
+    association_domains = []
+    for entry in parsed_schemas:
+        marked_fields = _multi_link_participants(entry["schema"])
+        participant_domains = [field.get("relatedDomain") for field in marked_fields]
+        if len(participant_domains) >= 2 and all(isinstance(domain, str) for domain in participant_domains):
+            association_domains.append((entry, participant_domains))
+
+    synced = []
+    for association_entry, participants in association_domains:
+        pair_edges = []
+        seen_pairs = set()
+        for candidate in parsed_schemas:
+            if candidate["table_name"] == association_entry["table_name"]:
+                continue
+            candidate_fields = candidate["schema"]
+            if _multi_link_participants(candidate_fields):
+                continue
+            if len(candidate_fields) != 2:
+                continue
+            domain_to_field = {}
+            for field in candidate_fields:
+                field_id = field.get("field_id")
+                related_domain = field.get("relatedDomain")
+                if related_domain in participants and isinstance(field_id, str):
+                    domain_to_field[related_domain] = field_id
+                elif isinstance(field_id, str):
+                    inferred_domain = next(
+                        (domain for domain in participants if field_id == f"{domain}Id"),
+                        None,
+                    )
+                    if inferred_domain:
+                        domain_to_field[inferred_domain] = field_id
+            if len(domain_to_field) != 2:
+                continue
+            domains = tuple(sorted(domain_to_field))
+            if domains[0] == domains[1] or domains in seen_pairs:
+                continue
+            seen_pairs.add(domains)
+            pair_edges.append({
+                "table_name": candidate["table_name"],
+                "domains": domains,
+                "fields": domain_to_field,
+            })
+
+        if table_name not in participants and not any(
+            edge["table_name"] == table_name for edge in pair_edges
+        ):
+            continue
+
+        pair_rows = []
+        for edge in pair_edges:
+            pair_rows.append({
+                **edge,
+                "rows": await _list_rows(edge["table_name"]),
+            })
+        tuples = _join_association_rows(pair_rows, participants)
+        live_ids = {
+            participant: {
+                str(row["id"])
+                for row in await _list_rows(participant)
+                if row.get("id") is not None
+            }
+            for participant in participants
+        }
+        tuples = [
+            tuple_row for tuple_row in tuples
+            if all(tuple_row[participant] in live_ids[participant] for participant in participants)
+        ]
+        association_schema = association_entry["schema"]
+        output_rows = [
+            {
+                field["field_id"]: tuple_row[field["relatedDomain"]]
+                for field in _multi_link_participants(association_schema)
+            }
+            for tuple_row in tuples
+        ]
+        await _replace_rows(
+            association_entry["table_name"],
+            association_schema,
+            output_rows,
+        )
+        synced.append({
+            "table_name": association_entry["table_name"],
+            "rows_synced": len(output_rows),
+        })
+    return synced
+
+
+async def _reject_direct_multi_link_write(table_name: str) -> None:
+    from ..db.repositories.datastore_repo import get_schema
+    schema = _extract_schema_list(await get_schema(table_name))
+    if len(_multi_link_participants(schema)) >= 2:
+        raise HTTPException(
+            status_code=409,
+            detail=(
+                f"'{table_name}' is derived from its pairwise link domains. "
+                "Update the pairwise links; the multi-link rows are synchronized automatically."
+            ),
+        )
+
+
+def _multi_link_pairwise_table_specs(table_name: str, schema: list[dict]) -> list[dict]:
+    """Build the ordinary source-target junction spec for each multi-link field."""
+    specs = []
+    for field in schema:
+        if field.get("multi_link") is not True:
+            continue
+        target = field["target_domain"].strip()
+        junction_name = f"{table_name}_{target}"
+        if len(junction_name) > 63:
+            raise HTTPException(
+                status_code=400,
+                detail=f"Generated pairwise link table name '{junction_name}' exceeds the 63-character limit",
+            )
+        specs.append({
+            "table_name": junction_name,
+            "label": f"{table_name} linked to {target}",
+            "schema": [
+                {
+                    "field_id": f"{table_name}Id",
+                    "type": "text",
+                    "label": f"{table_name} ID",
+                    "value": None,
+                    "relationKind": "association",
+                    "relatedDomain": table_name,
+                },
+                {
+                    "field_id": f"{target}Id",
+                    "type": "text",
+                    "label": field.get("label") or f"{target} ID",
+                    "value": None,
+                    "relationKind": "association",
+                    "relatedDomain": target,
+                },
+            ],
+        })
+    return specs
+
+
 # ── 1. Create table from schema ────────────────────────────────
 
 @router.post("/create", summary="Create a database table from a JSON schema (DynamoDB or PostgreSQL)")
@@ -433,14 +705,16 @@ async def create_table(body: CreateTableRequest, request: Request):
 
     schema = [f.model_dump() for f in body.schema]
     is_dynamo = settings.DB_BACKEND == "dynamodb"
+    linked_fields = [field for field in schema if field.get("multi_link") is True]
+    associative_fields = _multi_link_participants(schema)
 
     # Project → Module → Domain model: validate/derive the scope first.
     project_id, module_id = await _resolve_scope(body.project_id, body.module_id)
     multi_link_spec = await _multi_link_table_spec(body.table_name, schema)
-    domain_schema = (
-        [field for field in schema if field.get("multi_link") is not True]
-        if multi_link_spec else schema
-    )
+    pairwise_specs = _multi_link_pairwise_table_specs(body.table_name, schema)
+    # Multi-link fields are logical relations and physical source columns:
+    # the selected IDs are stored on this row as well as in the junctions.
+    domain_schema = schema
 
     # 0. Draft — persist it and stop. No DDL, no datastore_schemas row.
     #    The tables get generated by POST /datastore/drafts/{id}/submit.
@@ -450,6 +724,7 @@ async def create_table(body: CreateTableRequest, request: Request):
             "table_name": body.table_name,
             "label":      body.label,
             "schema":     domain_schema,
+            "metadata_schema": schema,
             "project_id": project_id,
             "module_id":  module_id,
         }]
@@ -459,6 +734,11 @@ async def create_table(body: CreateTableRequest, request: Request):
                 "project_id": project_id,
                 "module_id":  module_id,
             })
+        tables.extend({
+            **pairwise_spec,
+            "project_id": project_id,
+            "module_id": module_id,
+        } for pairwise_spec in pairwise_specs)
         saved = await _save_draft(
             body.table_name,
             {
@@ -486,9 +766,25 @@ async def create_table(body: CreateTableRequest, request: Request):
     result = await create_table_from_schema(body.table_name, domain_schema)
 
     # 2. Save / update schema metadata
-    await save_schema(body.table_name, domain_schema, project_id, module_id, body.label)
+    await save_schema(body.table_name, schema, project_id, module_id, body.label)
 
     action = "created" if result["created"] else "already existed"
+    pairwise_results = []
+    for pairwise_spec in pairwise_specs:
+        pairwise_result = await create_table_from_schema(
+            pairwise_spec["table_name"], pairwise_spec["schema"]
+        )
+        await save_schema(
+            pairwise_spec["table_name"],
+            pairwise_spec["schema"],
+            project_id,
+            module_id,
+            pairwise_spec["label"],
+        )
+        pairwise_results.append({
+            "table_name": pairwise_spec["table_name"],
+            "table_created": pairwise_result["created"],
+        })
     linked_table_result = None
     if multi_link_spec:
         linked_table_result = await create_table_from_schema(
@@ -500,6 +796,11 @@ async def create_table(body: CreateTableRequest, request: Request):
             project_id,
             module_id,
             multi_link_spec["label"],
+        )
+    initial_multi_link_sync = []
+    if len(associative_fields) >= 2:
+        initial_multi_link_sync = await _sync_multi_link_domains_for_pairwise_table(
+            associative_fields[0]["relatedDomain"]
         )
 
     # Build backend-specific fields for the response
@@ -525,9 +826,15 @@ async def create_table(body: CreateTableRequest, request: Request):
             for f in domain_schema
         ],
         "total_fields": len(domain_schema),
+        **({"multi_link_sync": initial_multi_link_sync} if initial_multi_link_sync else {}),
+        **({"pairwise_tables": pairwise_results} if pairwise_results else {}),
         "message": (
             f"Table '{body.table_name}' {action} {location_str} "
             f"with {len(domain_schema)} field(s). Primary key: id."
+            + (
+                f" Pairwise link table(s): {', '.join(item['table_name'] for item in pairwise_results)}."
+                if pairwise_results else ""
+            )
             + (
                 f" Multi-link table '{multi_link_spec['table_name']}' "
                 f"{'created' if linked_table_result['created'] else 'already existed'}."
@@ -541,6 +848,10 @@ async def create_table(body: CreateTableRequest, request: Request):
                 "schema": multi_link_spec["schema"],
             }}
             if multi_link_spec else {}
+        ),
+        **(
+            {"multi_link_pending": True}
+            if linked_fields and not multi_link_spec else {}
         ),
     }
 
@@ -664,7 +975,11 @@ async def submit_draft_route(draft_id: str, request: Request):
 @router.post("/{table_name}/row", dependencies=[Depends(require_permission("create"))], summary="Insert a row — each field stored as a separate column")
 @handle_errors
 async def insert_row(table_name: str, request: Request, body: dict[str, Any] = Body(...)):
-    from ..db.repositories.datastore_repo import get_schema, insert_row as _insert
+    from ..db.repositories.datastore_repo import (
+        get_schema,
+        insert_row as _insert,
+        insert_row_with_links as _insert_with_links,
+    )
 
     schema_result = await get_schema(table_name)
     if not schema_result:
@@ -679,6 +994,7 @@ async def insert_row(table_name: str, request: Request, body: dict[str, Any] = B
             status_code=404,
             detail=f"Schema for '{table_name}' is empty or unreadable."
         )
+    await _reject_direct_multi_link_write(table_name)
 
     # ── Server-side validation ────────────────────────────
     validation_errors = _validate_row(schema, body)
@@ -687,6 +1003,44 @@ async def insert_row(table_name: str, request: Request, body: dict[str, Any] = B
             status_code=422,
             detail={"message": "Validation failed", "errors": validation_errors}
         )
+
+    link_fields = [field for field in schema if field.get("multi_link") is True]
+    link_spec = None
+    if link_fields:
+        link_spec = await _multi_link_table_spec(table_name, schema)
+        if link_spec is None:
+            raise HTTPException(
+                status_code=409,
+                detail="This domain has an incomplete multi-link definition; add at least two linked-domain fields first.",
+            )
+        junction_schema = await get_schema(link_spec["table_name"])
+        if not junction_schema:
+            raise HTTPException(
+                status_code=409,
+                detail=f"Multi-link table '{link_spec['table_name']}' is not registered. Re-save the domain schema to create it.",
+            )
+        for pairwise_spec in _multi_link_pairwise_table_specs(table_name, schema):
+            if not await get_schema(pairwise_spec["table_name"]):
+                raise HTTPException(
+                    status_code=409,
+                    detail=f"Pairwise link table '{pairwise_spec['table_name']}' is not registered. Re-save the domain schema to create it.",
+                )
+
+        missing_links = [
+            field.get("label") or field["field_id"]
+            for field in link_fields
+            if body.get(field["field_id"]) is None
+            or str(body.get(field["field_id"])).strip() == ""
+        ]
+        if missing_links:
+            raise HTTPException(
+                status_code=422,
+                detail={
+                    "message": "All fields in the combined multi-link are required.",
+                    "errors": {field["field_id"]: "Select a related record." for field in link_fields
+                               if (field.get("label") or field["field_id"]) in missing_links},
+                },
+            )
 
     # Show the mapping: schema field → input value → stored type
     mapping = []
@@ -704,12 +1058,27 @@ async def insert_row(table_name: str, request: Request, body: dict[str, Any] = B
                               "String (S)",
         })
 
-    record_id = await _insert(table_name, schema, body)
+    if link_spec:
+        try:
+            record_id = await _insert_with_links(
+                table_name,
+                schema,
+                body,
+                link_spec["table_name"],
+                link_fields,
+            )
+        except ValueError as exc:
+            raise HTTPException(status_code=422, detail=str(exc)) from exc
+    else:
+        record_id = await _insert(table_name, schema, body)
+    synchronized_domains = await _sync_multi_link_domains_for_pairwise_table(table_name)
 
     return {
         "status":        "success",
         "table_name":    table_name,
         "record_id":     record_id,
+        **({"multi_link_sync": synchronized_domains} if synchronized_domains else {}),
+        **({"linked_table": link_spec["table_name"]} if link_spec else {}),
         "field_mapping": mapping,
     }
 
@@ -746,6 +1115,7 @@ def _filter_rows_by_query(rows: list[dict], params) -> list[dict]:
 async def list_rows(table_name: str, request: Request):
     from ..db.repositories.datastore_repo import list_rows as _list
     rows = await _list(table_name)
+    rows = await _attach_multi_link_values(table_name, rows)
     rows = await _apply_field_rules(request, table_name, rows)
     # Optional column filters: GET /datastore/Department/rows?departmentName=BIO
     # Applied AFTER field rules so only columns the caller may see can be filtered on.
@@ -762,6 +1132,7 @@ async def get_row(table_name: str, record_id: str, request: Request):
     row = await _get(table_name, record_id)
     if not row:
         raise HTTPException(status_code=404, detail="Row not found")
+    row = (await _attach_multi_link_values(table_name, [row]))[0]
     row = (await _apply_field_rules(request, table_name, [row]))[0]
     return {"status": "success", "table_name": table_name, "data": row}
 
@@ -916,10 +1287,16 @@ async def delete_field_route(table_name: str, field_id: str, request: Request):
 @handle_errors
 async def update_row(table_name: str, record_id: str, request: Request, body: dict[str, Any] = Body(...)):
     from ..db.repositories.datastore_repo import update_row as _update
+    await _reject_direct_multi_link_write(table_name)
     result = await _update(table_name, record_id, body)
     if result.get("status") == "error":
         raise HTTPException(status_code=400, detail=result.get("message", "Update failed"))
-    return {"status": "success", "record_id": record_id}
+    synchronized_domains = await _sync_multi_link_domains_for_pairwise_table(table_name)
+    return {
+        "status": "success",
+        "record_id": record_id,
+        **({"multi_link_sync": synchronized_domains} if synchronized_domains else {}),
+    }
 
 
 # ── 8. Delete a row ────────────────────────────────────────────
@@ -928,10 +1305,16 @@ async def update_row(table_name: str, record_id: str, request: Request, body: di
 @handle_errors
 async def delete_row(table_name: str, record_id: str, request: Request):
     from ..db.repositories.datastore_repo import delete_row as _delete
+    await _reject_direct_multi_link_write(table_name)
     result = await _delete(table_name, record_id)
     if result.get("status") == "error":
         raise HTTPException(status_code=400, detail=result.get("message", "Delete failed"))
-    return {"status": "success", "record_id": record_id}
+    synchronized_domains = await _sync_multi_link_domains_for_pairwise_table(table_name)
+    return {
+        "status": "success",
+        "record_id": record_id,
+        **({"multi_link_sync": synchronized_domains} if synchronized_domains else {}),
+    }
 
 
 # ── 8b. Restore an archived row ────────────────────────────────
@@ -940,10 +1323,16 @@ async def delete_row(table_name: str, record_id: str, request: Request):
 @handle_errors
 async def restore_row_route(table_name: str, record_id: str, request: Request):
     from ..db.repositories.datastore_repo import restore_row as _restore
+    await _reject_direct_multi_link_write(table_name)
     result = await _restore(table_name, record_id)
     if result.get("status") == "error":
         raise HTTPException(status_code=result.get("code", 400), detail=result.get("message", "Restore failed"))
-    return {"status": "success", "record_id": record_id}
+    synchronized_domains = await _sync_multi_link_domains_for_pairwise_table(table_name)
+    return {
+        "status": "success",
+        "record_id": record_id,
+        **({"multi_link_sync": synchronized_domains} if synchronized_domains else {}),
+    }
 
 
 # ── 9. List archived rows ──------------------------------------
