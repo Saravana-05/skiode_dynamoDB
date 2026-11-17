@@ -1,0 +1,91 @@
+[pages]
+list_pages = """
+SELECT p.id, p.slug, p.title, p.published_version, p.created_by, p.created_at, p.updated_at,
+       p.visibility, p.allowed_emails, p.allowed_roles, p.project_id,
+       (SELECT MAX(version) FROM page_versions v WHERE v.page_id = p.id) AS latest_version,
+       EXISTS (SELECT 1 FROM page_versions v WHERE v.page_id = p.id AND v.status = 'draft') AS has_draft
+FROM pages p
+WHERE p.is_active = TRUE
+ORDER BY p.updated_at DESC
+"""
+
+get_page_by_slug = """
+SELECT * FROM pages WHERE slug = $1 AND is_active = TRUE
+"""
+
+upsert_page = """
+INSERT INTO pages (slug, title, created_by, visibility)
+VALUES ($1, $2, $3, 'authenticated')
+ON CONFLICT (slug) DO UPDATE
+SET title = EXCLUDED.title, is_active = TRUE, updated_at = NOW()
+RETURNING *
+"""
+
+get_latest_draft = """
+SELECT * FROM page_versions
+WHERE page_id = $1 AND status = 'draft'
+ORDER BY version DESC LIMIT 1
+"""
+
+get_version = """
+SELECT * FROM page_versions WHERE page_id = $1 AND version = $2
+"""
+
+list_versions = """
+SELECT id, page_id, version, status, label, created_by, created_at, published_at
+FROM page_versions WHERE page_id = $1 ORDER BY version DESC
+"""
+
+next_version = """
+SELECT COALESCE(MAX(version), 0) + 1 AS version FROM page_versions WHERE page_id = $1
+"""
+
+insert_version = """
+INSERT INTO page_versions (page_id, version, status, label, document, created_by)
+VALUES ($1, $2, 'draft', $3, $4::jsonb, $5)
+RETURNING *
+"""
+
+update_draft = """
+UPDATE page_versions
+SET document = $2::jsonb, label = COALESCE($3, label)
+WHERE id = $1
+RETURNING *
+"""
+
+archive_published = """
+UPDATE page_versions SET status = 'archived'
+WHERE page_id = $1 AND status = 'published'
+"""
+
+mark_published = """
+UPDATE page_versions SET status = 'published', published_at = NOW()
+WHERE id = $1
+RETURNING *
+"""
+
+set_published_version = """
+UPDATE pages SET published_version = $2, updated_at = NOW() WHERE id = $1
+"""
+
+get_published_version = """
+SELECT * FROM page_versions
+WHERE page_id = $1 AND status = 'published'
+ORDER BY version DESC LIMIT 1
+"""
+
+soft_delete_page = """
+UPDATE pages SET is_active = FALSE, updated_at = NOW() WHERE slug = $1
+"""
+
+set_project = """
+UPDATE pages SET project_id = $2, updated_at = NOW()
+WHERE id = $1
+RETURNING *
+"""
+
+set_access = """
+UPDATE pages SET visibility = $2, allowed_emails = $3::jsonb, allowed_roles = $4::jsonb, updated_at = NOW()
+WHERE id = $1
+RETURNING *
+"""

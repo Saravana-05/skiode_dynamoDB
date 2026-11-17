@@ -57,9 +57,11 @@ async def get_auth_context(user_id: str) -> dict:
     Effective permissions = RBAC role permissions + grants from the domain
     ABAC rules (Permissions tab), minus anything an ABAC rule denies.
     """
-    roles = await rbac_repo.get_user_roles(user_id)
+    # all_projects=True: roles given inside a project (Project Users screen) count too,
+    # otherwise a project-only user gets empty roles/permissions at login.
+    roles = await rbac_repo.get_user_roles(user_id, all_projects=True)
     role_names = [r["name"] for r in roles]
-    permissions = list(await rbac_repo.get_user_permissions(user_id))
+    permissions = list(await rbac_repo.get_user_permissions(user_id, all_projects=True))
 
     try:
         grants, denies = await abac_service.effective_permissions(role_names)
@@ -76,14 +78,26 @@ async def get_auth_context(user_id: str) -> dict:
     return {"roles": role_names, "permissions": permissions}
 
 
-async def user_has_permission(current_user: dict, resource: str, action: str) -> bool:
+async def user_has_permission(current_user: dict, resource: str, action: str, project_id=None,
+                              all_projects: bool = False) -> bool:
+    """project_id: the project the resource (domain model) belongs to, if any.
+
+    Project-scoped resource  -> user must be a member of that project, and only
+                                global roles + roles given in that project count.
+    No project (global)      -> same behaviour as before.
+    """
     if is_admin(current_user):
         return True
     user_id = current_user["user_id"]
 
+    if project_id is not None and settings_project_isolation():
+        from ..idam.repositories import project_member_repo
+        if not await project_member_repo.is_member(user_id, project_id):
+            return False
+
     # Domain ABAC rules first: deny wins, allow grants, no opinion -> RBAC.
     try:
-        role_names = [r["name"] for r in await rbac_repo.get_user_roles(user_id)]
+        role_names = [r["name"] for r in await rbac_repo.get_user_roles(user_id, project_id, all_projects)]
         decision = await abac_service.decide_for(role_names, resource, action)
     except Exception:
         decision = None
@@ -92,9 +106,15 @@ async def user_has_permission(current_user: dict, resource: str, action: str) ->
     if decision == "allow":
         return True
 
-    perms = await rbac_repo.get_user_permissions(user_id)
+    perms = await rbac_repo.get_user_permissions(user_id, project_id, all_projects)
     r, a = resource.lower(), action.lower()
     return any(p["resource"].lower() == r and p["action"].lower() == a for p in perms)
+
+
+def settings_project_isolation() -> bool:
+    """Postgres only (idam.user_project lives there)."""
+    from ..core.config import settings
+    return settings.DB_BACKEND == "postgresql"
 
 
 # ═════════════════════════════════════════════════════════════════════════════
@@ -244,6 +264,7 @@ async def create_user(caller: dict, user_name: str, email: str, password: str, i
         username = f"{base}{counter}"
         counter += 1
 
+    # On PostgreSQL user_repo is backed by idam."user" (app/idam).
     created = await user_repo.create(
         username=username,
         email=email,

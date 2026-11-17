@@ -19,7 +19,7 @@ except GET /rbac/me which any logged-in user can call.
     DELETE /rbac/roles/{id}
     PUT    /rbac/roles/{id}/permissions       replace the role's permission set
 
-  Users
+  Users  (backed by the idam."user" table - see app/idam)
     GET    /rbac/users                        users + assigned roles
     POST   /rbac/users                        create a user (in the caller's organization)
     GET    /rbac/users/{id}/roles

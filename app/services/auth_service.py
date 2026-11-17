@@ -3,11 +3,12 @@ import jwt
 import re
 
 from ..core.config import settings
+from ..core.database import fetchrow
 from ..db.repositories import user_repo, organization_repo
 from ..utils.password import verify_password, hash_password
 from ..utils.jwt import create_tokens
 from ..utils.okta import decode_okta_token
-from . import rbac_service
+from . import rbac_service, project_service
 
 import logging
 
@@ -105,6 +106,27 @@ async def login_user(payload):
         else:
             role = "USER"
 
+        # Project-scoped login: when the caller says which project it is signing
+        # in for, only that project's users (and admins) get a token. Checked
+        # after the password so membership isn't revealed to anonymous callers.
+        project_id = payload.get("project_id")
+        page_slug = (payload.get("page_slug") or "").strip()
+        if project_id in (None, "") and page_slug:
+            # Signing in for a page: the page's project decides who may enter.
+            try:
+                prow = await fetchrow(
+                    "SELECT project_id FROM pages WHERE slug = $1 AND is_active = TRUE", page_slug)
+                if prow and prow["project_id"] is not None:
+                    project_id = str(prow["project_id"])
+            except Exception as exc:
+                logger.error(f"Could not resolve project of page '{page_slug}': {exc}")
+                return {"status": "error", "message": "Could not verify your access to this page"}
+        if project_id not in (None, ""):
+            denial = await project_service.check_login_project(user["user_id"], role, project_id)
+            if denial:
+                logger.warning(f"Login refused | user_id: {user.get('user_id')} | project: {project_id} | {denial}")
+                return {"status": "error", "message": denial, "code": "NOT_PROJECT_MEMBER"}
+
         tokens = create_tokens({
             "user_id": user["user_id"],
             "org_id": resolved_org_id,
@@ -123,6 +145,11 @@ async def login_user(payload):
         except Exception as e:
             logger.error(f"RBAC lookup failed (did you run app.db.init_rbac?): {e}")
             rbac_ctx = {"roles": [], "permissions": []}
+
+        # Projects this user is a member of (admins: all). The page builder uses
+        # this to decide who gets in: a non-admin with an empty list belongs to
+        # no project. None = not tracked on this backend (do not block).
+        projects = await project_service.projects_of_user({"user_id": user["user_id"], "role": role})
 
         return {
             "status": "success",
@@ -145,6 +172,8 @@ async def login_user(payload):
                 "role": role,
                 "roles": rbac_ctx["roles"],
                 "permissions": rbac_ctx["permissions"],
+                "is_admin": role in rbac_service.ADMIN_ROLES,
+                "projects": projects,
             },
         }
 

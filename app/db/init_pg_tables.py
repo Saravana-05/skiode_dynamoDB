@@ -51,6 +51,63 @@ CREATE TABLE IF NOT EXISTS datastore_schemas (
     schema      TEXT NOT NULL,
     created_at  VARCHAR
 );
+
+-- ── grid_layout ───────────────────────────────────────────────
+-- Stores the react-grid-layout JSON separately from user_interaction
+-- (page_data / component tree). "label" is a human-friendly name for
+-- this saved layout so the same page_name can have multiple labeled
+-- layout snapshots (e.g. "Tournament - Desktop", "Tournament - v2").
+CREATE TABLE IF NOT EXISTS grid_layout (
+    id          SERIAL PRIMARY KEY,
+    page_name   VARCHAR NOT NULL,
+    label       VARCHAR NOT NULL DEFAULT 'Untitled Layout',
+    layout_data JSONB NOT NULL,
+    created_by  VARCHAR,
+    created_at  TIMESTAMP NOT NULL DEFAULT NOW(),
+    updated_at  TIMESTAMP NOT NULL DEFAULT NOW()
+);
+CREATE INDEX IF NOT EXISTS idx_grid_layout_page_name ON grid_layout (page_name);
+
+-- ── pages / page_versions ─────────────────────────────────────
+-- Published View Builder pages served to the client renderer app.
+-- pages holds one row per slug. page_versions holds every saved version
+-- of its full page document (status is draft, published or archived).
+-- Only one version per page is published at a time (pages.published_version).
+CREATE TABLE IF NOT EXISTS pages (
+    id                SERIAL PRIMARY KEY,
+    slug              VARCHAR NOT NULL UNIQUE,
+    title             VARCHAR NOT NULL DEFAULT 'Untitled Page',
+    published_version INTEGER,
+    created_by        VARCHAR,
+    is_active         BOOLEAN NOT NULL DEFAULT TRUE,
+    created_at        TIMESTAMP NOT NULL DEFAULT NOW(),
+    updated_at        TIMESTAMP NOT NULL DEFAULT NOW()
+);
+
+CREATE TABLE IF NOT EXISTS page_versions (
+    id           SERIAL PRIMARY KEY,
+    page_id      INTEGER NOT NULL REFERENCES pages (id) ON DELETE CASCADE,
+    version      INTEGER NOT NULL,
+    status       VARCHAR NOT NULL DEFAULT 'draft',
+    label        VARCHAR,
+    document     JSONB NOT NULL,
+    created_by   VARCHAR,
+    created_at   TIMESTAMP NOT NULL DEFAULT NOW(),
+    published_at TIMESTAMP,
+    UNIQUE (page_id, version)
+);
+CREATE INDEX IF NOT EXISTS idx_page_versions_page_status ON page_versions (page_id, status);
+
+-- Who may view the published page (see utils/page_access.py).
+-- visibility is public, authenticated or restricted. Safe to run more than once.
+ALTER TABLE pages ADD COLUMN IF NOT EXISTS visibility VARCHAR NOT NULL DEFAULT 'authenticated';
+ALTER TABLE pages ADD COLUMN IF NOT EXISTS allowed_emails JSONB NOT NULL DEFAULT '[]'::jsonb;
+ALTER TABLE pages ADD COLUMN IF NOT EXISTS allowed_roles JSONB NOT NULL DEFAULT '[]'::jsonb;
+
+-- ── user_interaction: add label column (table created elsewhere) ─
+-- If user_interaction doesn't exist yet, this statement fails and
+-- init() just prints a warning and continues (see below) — safe.
+ALTER TABLE user_interaction ADD COLUMN IF NOT EXISTS label VARCHAR NOT NULL DEFAULT 'Untitled Page';
 """
 
 

@@ -36,6 +36,18 @@ def _anonymous_allowed(action: str) -> bool:
     return settings.ALLOW_ANONYMOUS_WRITE
 
 
+async def _project_of(resource: str):
+    """Project a domain model belongs to (None = global / not a domain model)."""
+    if settings.DB_BACKEND != "postgresql":
+        return None
+    try:
+        from ..db.repositories import datastore_repo
+        schema = await datastore_repo.get_schema(resource)
+    except Exception:
+        return None
+    return (schema or {}).get("project_id")
+
+
 def require_permission(action: str, resource: str | None = None, resource_param: str = "table_name"):
     """
     Build a dependency that allows the request only if the caller may
@@ -68,7 +80,8 @@ def require_permission(action: str, resource: str | None = None, resource_param:
         if not target:
             raise HTTPException(status_code=500, detail="RBAC: could not determine the protected resource")
 
-        if not await rbac_service.user_has_permission(current_user, target, action):
+        project_id = await _project_of(target)
+        if not await rbac_service.user_has_permission(current_user, target, action, project_id):
             raise HTTPException(status_code=403, detail=f"Permission denied: cannot {action} {target}")
         request.state.current_user = current_user   # lets the route apply field-level rules
         return current_user
