@@ -56,9 +56,16 @@ async def refresh_token(body: RefreshRequest):
 
 @router.get("/me")
 @handle_errors                                 # ← add
-async def get_me(project_id: Optional[str] = None, current_user: dict = Depends(get_current_user)):
+async def get_me(project_id: Optional[str] = None, page_slug: Optional[str] = None,
+                 current_user: dict = Depends(get_current_user)):
+    # page_slug: the client renderer only knows the page it is showing; its project decides the scope.
+    if not project_id and page_slug:
+        try:
+            project_id = await project_service.project_id_of_page(page_slug.strip())
+        except Exception:
+            project_id = None   # can't resolve: fall back to the unscoped context (UI only; the server re-checks every request)
     try:
-        ctx = await rbac_service.get_auth_context(current_user["user_id"])
+        ctx = await rbac_service.get_auth_context(current_user["user_id"], project_id)   # project_id -> scoped to it
     except Exception:
         ctx = {"roles": [], "permissions": []}   # RBAC tables not created yet
     projects = await project_service.projects_of_user(current_user)   # None = not tracked

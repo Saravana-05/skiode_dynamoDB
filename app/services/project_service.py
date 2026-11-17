@@ -22,6 +22,13 @@ def _restricted(current_user: dict | None) -> bool:
 
 
 
+async def project_id_of_page(slug: str) -> str | None:
+    """Project a published page belongs to (None = no project / unknown page)."""
+    from ..core.database import fetchrow
+    row = await fetchrow("SELECT project_id FROM pages WHERE slug = $1 AND is_active = TRUE", slug)
+    return str(row["project_id"]) if row and row["project_id"] is not None else None
+
+
 async def check_login_project(user_id: str, role: str, project_id) -> str | None:
     """Project-scoped login: may this user sign in FOR this project?
 
