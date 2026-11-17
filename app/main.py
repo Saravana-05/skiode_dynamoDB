@@ -42,6 +42,7 @@ origins = [
     "http://127.0.0.1:5175",
     "http://82.29.164.12:3000",
     "http://82.29.164.12:3001",
+    "http://82.29.164.12:3002",
     "http://192.168.0.107:5173",
     "http://192.168.0.107:5174",
     "http://domainmodelconfig.s3-website-ap-southeast-2.amazonaws.com",
