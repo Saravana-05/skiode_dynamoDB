@@ -219,7 +219,17 @@ class PagesService:
         async with pool.acquire() as conn:
             async with conn.transaction():
                 await conn.execute(pg_q["archive_published"], page["id"])
-                row = await conn.fetchrow(pg_q["mark_published"], target["id"])
+                # Use fetch() (not fetchrow()) inside this transaction. fetchrow()
+                # runs the statement with a row limit of 1, which leaves a suspended
+                # portal open on the connection; CockroachDB then rejects the next
+                # statement ("cannot perform operation sql.PrepareStmt while a
+                # different portal is open"). fetch() runs it to completion.
+                rows = await conn.fetch(pg_q["mark_published"], target["id"])
+                if not rows:
+                    # Raising rolls the transaction back, so the old published
+                    # version is not archived by mistake.
+                    raise RuntimeError("Could not mark the version as published")
+                row = rows[0]
                 await conn.execute(pg_q["set_published_version"], page["id"], row["version"])
         out = _row(row)
         out["slug"] = slug
