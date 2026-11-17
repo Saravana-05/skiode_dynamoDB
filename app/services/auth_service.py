@@ -141,7 +141,9 @@ async def login_user(payload):
         # If the RBAC tables haven't been created yet (python -m app.db.init_rbac)
         # don't lock everybody out of login - just return no permissions.
         try:
-            rbac_ctx = await rbac_service.get_auth_context(user["user_id"])
+            # project_id is set when signing in FOR a project (or a page of one):
+            # then roles/permissions are those the user holds inside that project.
+            rbac_ctx = await rbac_service.get_auth_context(user["user_id"], project_id)
         except Exception as e:
             logger.error(f"RBAC lookup failed (did you run app.db.init_rbac?): {e}")
             rbac_ctx = {"roles": [], "permissions": []}

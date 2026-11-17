@@ -51,17 +51,29 @@ def _ok(data=None, **extra):
 #  Permission checks (used by dependencies + login)
 # ═════════════════════════════════════════════════════════════════════════════
 
-async def get_auth_context(user_id: str) -> dict:
+async def get_auth_context(user_id: str, project_id=None) -> dict:
     """Roles + effective permissions for a user (what login / /auth/me return).
 
     Effective permissions = RBAC role permissions + grants from the domain
     ABAC rules (Permissions tab), minus anything an ABAC rule denies.
+
+    project_id given -> only what counts INSIDE that project (global roles +
+                        roles given in it), so a client signed in to project A
+                        never shows permissions the user only holds in project B.
+    project_id None  -> union across every project (the admin console).
     """
-    # all_projects=True: roles given inside a project (Project Users screen) count too,
-    # otherwise a project-only user gets empty roles/permissions at login.
-    roles = await rbac_repo.get_user_roles(user_id, all_projects=True)
+    scoped = project_id not in (None, "")
+    pid = None
+    if scoped:
+        try:
+            pid = int(project_id)
+        except (TypeError, ValueError):
+            return {"roles": [], "permissions": []}     # unknown project: fail closed
+    # all_projects=True when unscoped: roles given inside a project (Project Users screen)
+    # count too, otherwise a project-only user gets empty roles/permissions at login.
+    roles = await rbac_repo.get_user_roles(user_id, pid, all_projects=not scoped)
     role_names = [r["name"] for r in roles]
-    permissions = list(await rbac_repo.get_user_permissions(user_id, all_projects=True))
+    permissions = list(await rbac_repo.get_user_permissions(user_id, pid, all_projects=not scoped))
 
     try:
         grants, denies = await abac_service.effective_permissions(role_names)
