@@ -80,6 +80,7 @@ class SaveDraftRequest(BaseModel):
     document: PageDocument
     label: Optional[str] = None
     access: Optional[PageAccess] = None    # omit to leave the page's access unchanged
+    project_id: Optional[int] = None       # project this page belongs to (omit = unchanged)
 
 
 class PublishRequest(BaseModel):
@@ -158,6 +159,7 @@ async def save_draft(slug: str, payload: SaveDraftRequest,
             slug, payload.title, payload.document.model_dump(),
             payload.label, (str(current_user["user_id"]) if current_user.get("user_id") else None),
             payload.access.model_dump() if payload.access else None,
+            payload.project_id,
         )
         return success_response(result)
     except Exception as e:

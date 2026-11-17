@@ -169,32 +169,46 @@ async def set_role_permissions(role_id, permission_ids):
 
 # ── User ↔ role ───────────────────────────────────────────────────────────────
 
-async def get_user_roles(user_id):
+# project_id=None means GLOBAL assignments only. With a project_id the result is
+# global roles + roles assigned inside that project.
+# all_projects=True counts roles from EVERY project too (use for global resources
+# that are not tied to one project, e.g. published pages, login/auth-me context).
+
+async def get_user_roles(user_id, project_id=None, all_projects=False):
     rows = await fetch(
         """
-        SELECT r.id, r.name, r.description
+        SELECT DISTINCT r.id, r.name, r.description
         FROM rbac_user_roles ur JOIN rbac_roles r ON r.id = ur.role_id
-        WHERE ur.user_id = $1 ORDER BY LOWER(r.name)
+        WHERE ur.user_id = $1
+          AND ($3::boolean OR ur.project_id IS NULL OR ur.project_id = $2)
+        ORDER BY r.name
         """,
-        str(user_id),
+        int(user_id), int(project_id) if project_id is not None else None, bool(all_projects),
     )
     return [dict(r) for r in rows]
 
 
-async def set_user_roles(user_id, role_ids):
+async def set_user_roles(user_id, role_ids, project_id=None):
+    """Replace the user's roles in ONE scope (global when project_id is None)."""
+    uid = int(user_id)
+    pid = int(project_id) if project_id is not None else None
     pool = await ensure_pool()
     async with pool.acquire() as conn:
         async with conn.transaction():
-            await conn.execute("DELETE FROM rbac_user_roles WHERE user_id = $1", str(user_id))
+            await conn.execute(
+                "DELETE FROM rbac_user_roles WHERE user_id = $1 AND project_id IS NOT DISTINCT FROM $2",
+                uid, pid,
+            )
             if role_ids:
                 await conn.executemany(
-                    "INSERT INTO rbac_user_roles (user_id, role_id) VALUES ($1,$2) ON CONFLICT DO NOTHING",
-                    [(str(user_id), rid) for rid in role_ids],
+                    "INSERT INTO rbac_user_roles (user_id, role_id, project_id) VALUES ($1,$2,$3) "
+                    "ON CONFLICT DO NOTHING",
+                    [(uid, rid, pid) for rid in role_ids],
                 )
 
 
-async def get_user_permissions(user_id):
-    """Effective permissions = union over all of the user's roles."""
+async def get_user_permissions(user_id, project_id=None, all_projects=False):
+    """Effective permissions = union over the user's roles (global + that project)."""
     rows = await fetch(
         """
         SELECT DISTINCT r.name AS resource, p.action
@@ -203,36 +217,37 @@ async def get_user_permissions(user_id):
         JOIN rbac_permissions p       ON p.id = rp.permission_id
         JOIN rbac_resources  r        ON r.id = p.resource_id
         WHERE ur.user_id = $1
+          AND ($3::boolean OR ur.project_id IS NULL OR ur.project_id = $2)
         ORDER BY r.name, p.action
         """,
-        str(user_id),
+        int(user_id), int(project_id) if project_id is not None else None, bool(all_projects),
     )
     return [{"resource": r["resource"], "action": r["action"]} for r in rows]
 
 
-# ── Users (for the "User Roles" screen) ───────────────────────────────────────
+# ── Users (for the "User Roles" screen) — reads idam."user" ───────────────────
 
 async def list_users(org_id=None):
     """Users with their assigned roles. org_id=None → every org (product admin)."""
     sql = """
-        SELECT u.id AS user_id, ud.user_name, COALESCE(ud.mail_id, u.email) AS email,
-               u.is_superuser, u.is_active, ud.organization_id
-        FROM auth_user u
-        LEFT JOIN form_generator_userdata ud ON ud.user_id = u.id
+        SELECT u.id AS user_id, COALESCE(u.user_name, u.username) AS user_name, u.email,
+               u.is_superuser, u.is_active, u.organization_id
+        FROM idam."user" u
     """
     args = []
     if org_id is not None:
-        sql += " WHERE ud.organization_id = $1"
+        sql += " WHERE u.organization_id = $1"
         args.append(int(org_id))
-    sql += " ORDER BY LOWER(COALESCE(ud.user_name, u.username))"
+    sql += " ORDER BY LOWER(COALESCE(u.user_name, u.username))"
     rows = await fetch(sql, *args)
 
     role_rows = await fetch(
-        "SELECT ur.user_id, r.id, r.name FROM rbac_user_roles ur JOIN rbac_roles r ON r.id = ur.role_id"
+        "SELECT ur.user_id, r.id, r.name FROM rbac_user_roles ur JOIN rbac_roles r ON r.id = ur.role_id "
+        "WHERE ur.project_id IS NULL"
     )
     roles_by_user: dict[str, list] = {}
     for rr in role_rows:
-        roles_by_user.setdefault(rr["user_id"], []).append({"id": rr["id"], "name": rr["name"]})
+        roles_by_user.setdefault(str(rr["user_id"]), []).append({"id": rr["id"], "name": rr["name"]})
 
     return [
         {

@@ -80,10 +80,14 @@ class PagesService:
 
     async def save_draft(self, slug: str, title: str, document: dict,
                          label: str | None, created_by: str | None,
-                         access: dict | None = None) -> dict:
+                         access: dict | None = None,
+                         project_id: int | None = None) -> dict:
         """Create the page if needed, then overwrite the open draft or start a new one."""
         page = await fetchrow(pg_q["upsert_page"], slug, title, created_by)
         await self._ensure_rbac_resource(slug, title)
+        if project_id is not None:
+            # Link the page to its project: only that project's members (and admins) may open it.
+            page = await fetchrow(pg_q["set_project"], page["id"], int(project_id))
         if access is not None:
             a = normalize_access(access.get("visibility"), access.get("allowed_emails"), access.get("allowed_roles"))
             page = await fetchrow(
@@ -133,7 +137,7 @@ class PagesService:
         except Exception:
             pass
         try:
-            roles = [r["name"] for r in await rbac_repo.get_user_roles(user["user_id"])]
+            roles = [r["name"] for r in await rbac_repo.get_user_roles(user["user_id"], all_projects=True)]
         except Exception:
             pass
         return {
@@ -159,7 +163,7 @@ class PagesService:
                 a["visibility"] = "authenticated"   # RBAC switched off: any signed-in user
             elif viewer.get("signed_in"):
                 viewer["has_permission"] = await rbac_service.user_has_permission(
-                    user, page_resource(slug), PAGE_ACTION
+                    user, page_resource(slug), PAGE_ACTION, all_projects=True
                 )
         verdict = decide_access(
             a["visibility"], a["allowed_emails"], a["allowed_roles"],
@@ -167,6 +171,14 @@ class PagesService:
         )
         if verdict != "allow":
             return verdict, None
+        # Project gate: a page that belongs to a project is only for that project's
+        # users (admins always pass). Public pages stay public.
+        page_project = dict(page).get("project_id")
+        if (page_project is not None and a["visibility"] != "public"
+                and not viewer.get("is_admin") and rbac_service.settings_project_isolation()):
+            from ..idam.repositories import project_member_repo
+            if not await project_member_repo.is_member(user["user_id"], page_project):
+                return "forbidden", None
         row = await fetchrow(pg_q["get_version"], page["id"], page["published_version"])
         if not row:
             return "missing", None

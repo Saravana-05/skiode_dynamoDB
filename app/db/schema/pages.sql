@@ -29,8 +29,12 @@ CREATE INDEX IF NOT EXISTS idx_page_versions_page_status ON page_versions (page_
 
 -- Who may view the published page (see utils/page_access.py).
 -- visibility is rbac, public, authenticated or restricted. Safe to run more than once.
-ALTER TABLE pages ADD COLUMN IF NOT EXISTS visibility VARCHAR NOT NULL DEFAULT 'rbac';
+ALTER TABLE pages ADD COLUMN IF NOT EXISTS visibility VARCHAR NOT NULL DEFAULT 'authenticated';
 -- Existing pages: hand them to RBAC (then grant 'view' on page:<slug> to roles)
 -- UPDATE pages SET visibility = 'rbac';
 ALTER TABLE pages ADD COLUMN IF NOT EXISTS allowed_emails JSONB NOT NULL DEFAULT '[]'::jsonb;
 ALTER TABLE pages ADD COLUMN IF NOT EXISTS allowed_roles JSONB NOT NULL DEFAULT '[]'::jsonb;
+
+-- Project a page belongs to: only that project's users (idam.user_project) may open it.
+ALTER TABLE pages ADD COLUMN IF NOT EXISTS project_id INTEGER REFERENCES projects (id) ON DELETE SET NULL;
+CREATE INDEX IF NOT EXISTS idx_pages_project ON pages (project_id);

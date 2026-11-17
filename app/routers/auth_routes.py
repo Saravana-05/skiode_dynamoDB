@@ -6,7 +6,7 @@ from ..dependencies.auth_dependency import get_current_user
 from ..core.security import verify_token
 from ..utils.jwt import create_access_token
 from ..utils.decorators import handle_errors   # ← add
-from ..services import rbac_service
+from ..services import rbac_service, project_service
 
 router = APIRouter(prefix="/auth", tags=["Auth"])
 
@@ -15,6 +15,11 @@ class LoginRequest(BaseModel):
     mail_id: Optional[str] = None
     password: Optional[str] = None
     id_token: Optional[str] = None
+    # Sign in FOR this project: only its users (and admins) are let in.
+    project_id: Optional[str] = None
+    # Or sign in FOR a published page: the page's project is looked up and the
+    # same membership rule applies (so the client only needs to send the slug).
+    page_slug: Optional[str] = None
 
     model_config = {"json_schema_extra": {"example": {"mail_id": "user@example.com", "password": "yourpassword"}}}
 
@@ -51,12 +56,18 @@ async def refresh_token(body: RefreshRequest):
 
 @router.get("/me")
 @handle_errors                                 # ← add
-async def get_me(current_user: dict = Depends(get_current_user)):
+async def get_me(project_id: Optional[str] = None, current_user: dict = Depends(get_current_user)):
     try:
         ctx = await rbac_service.get_auth_context(current_user["user_id"])
     except Exception:
         ctx = {"roles": [], "permissions": []}   # RBAC tables not created yet
-    return {"status": "success", "data": {**current_user, **ctx}}
+    projects = await project_service.projects_of_user(current_user)   # None = not tracked
+    data = {**current_user, **ctx, "is_admin": rbac_service.is_admin(current_user), "projects": projects}
+    if project_id:
+        # may this token's user work in this project? (admins always; others only as members)
+        denial = await project_service.check_login_project(current_user["user_id"], current_user.get("role"), project_id)
+        data["in_project"] = denial is None
+    return {"status": "success", "data": data}
 
 
 @router.post("/logout")

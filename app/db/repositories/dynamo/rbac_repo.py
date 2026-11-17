@@ -233,7 +233,7 @@ async def set_role_permissions(role_id, permission_ids):
 
 # ── User ↔ role ───────────────────────────────────────────────────────────────
 
-async def get_user_roles(user_id):
+async def get_user_roles(user_id, project_id=None, all_projects=False):
     ur_tbl = await _tbl(settings.TABLE_RBAC_USER_ROLES)
     links = await _query_all(ur_tbl, KeyConditionExpression=Key("user_id").eq(str(user_id)))
     roles = {r["id"]: r for r in await list_roles()}
@@ -253,7 +253,7 @@ async def set_user_roles(user_id, role_ids):
         await ur_tbl.put_item(Item={"user_id": user_id, "role_id": rid, "created_at": _now()})
 
 
-async def get_user_permissions(user_id):
+async def get_user_permissions(user_id, project_id=None, all_projects=False):
     ur_tbl = await _tbl(settings.TABLE_RBAC_USER_ROLES)
     rp_tbl = await _tbl(settings.TABLE_RBAC_ROLE_PERMISSIONS)
     role_ids = [l["role_id"] for l in
