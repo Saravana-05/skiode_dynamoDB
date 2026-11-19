@@ -251,7 +251,7 @@ async def submit_draft(draft_id: int | str) -> dict:
     # Imported lazily and through the facade so the active backend
     # (postgresql / dynamodb) switch still applies to submitted tables,
     # exactly as it does for a direct POST /datastore/create.
-    from ..datastore_repo import create_table_from_schema, save_schema
+    from ..datastore_repo import create_table_from_schema, save_schema, resolve_for_save
 
     project_id = draft.get("project_id")
     module_id  = draft.get("module_id")
@@ -263,15 +263,26 @@ async def submit_draft(draft_id: int | str) -> dict:
         if not table_name:
             continue
         try:
-            created = await create_table_from_schema(table_name, schema)
+            spec_project_id = spec.get("project_id", project_id)
+            # Same per-project rule as POST /datastore/create: the same name may
+            # exist in another project, never twice in this one. (A same-name model
+            # already in this project is treated as the one being (re)submitted, so
+            # retrying a half-applied draft works.)
+            r = await resolve_for_save(table_name, spec_project_id)
+            if r.get("conflict"):
+                raise ValueError(r["conflict"])
+            key, dname = r["key"], r["domain_name"]
+            created = await create_table_from_schema(key, schema, spec_project_id, dname)
             await save_schema(
-                table_name, schema,
-                spec.get("project_id", project_id),
+                key, schema,
+                spec_project_id,
                 spec.get("module_id", module_id),
                 spec.get("label"),
+                dname,
             )
             results.append({
-                "table_name": table_name,
+                "table_name": key,
+                "domain_name": dname,
                 "created":    bool(created.get("created")),
                 "status":     "success",
             })

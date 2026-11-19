@@ -124,17 +124,17 @@ async def update_module(
 async def count_domains(module_id: int | str) -> int:
     """Submitted domain models + open drafts that sit in this module."""
     await _ensure_modules_table()
-    from .datastore_repo import _ensure_datastore_schemas_table
+    from .datastore_repo import count_domains_in_module
     from .domain_draft_repo import _ensure_drafts_table
-    await _ensure_datastore_schemas_table()
     await _ensure_drafts_table()
     mid = int(module_id)
-    a = await fetchrow("SELECT COUNT(*) AS n FROM datastore_schemas WHERE module_id = $1", mid)
+    # domain models live in per-project datastore_schemas tables
+    a = await count_domains_in_module(mid)
     b = await fetchrow(
         "SELECT COUNT(*) AS n FROM domain_model_drafts WHERE module_id = $1 AND status = 'draft'",
         mid,
     )
-    return int(a["n"]) + int(b["n"])
+    return a + int(b["n"])
 
 
 async def delete_module(module_id: int | str) -> bool:
@@ -151,15 +151,14 @@ async def delete_modules_of_project(project_id: int | str) -> int:
     Domain models themselves are NOT deleted.
     """
     await _ensure_modules_table()
-    from .datastore_repo import _ensure_datastore_schemas_table
+    from .datastore_repo import detach_module_domains
     from .domain_draft_repo import _ensure_drafts_table
-    await _ensure_datastore_schemas_table()
     await _ensure_drafts_table()
     pid = int(project_id)
     ids = [r["id"] for r in await fetch("SELECT id FROM modules WHERE project_id = $1", pid)]
     if not ids:
         return 0
-    await execute("UPDATE datastore_schemas SET module_id = NULL WHERE module_id = ANY($1::INTEGER[])", ids)
+    await detach_module_domains(ids)
     await execute("UPDATE domain_model_drafts SET module_id = NULL WHERE module_id = ANY($1::INTEGER[])", ids)
     await execute("DELETE FROM modules WHERE project_id = $1", pid)
     return len(ids)
