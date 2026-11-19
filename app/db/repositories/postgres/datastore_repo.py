@@ -11,6 +11,7 @@ PostgreSQL implementation of the dynamic datastore repo.
   storing one row per (attribute, language) — en / ta / ar labels
 """
 import json
+import re
 
 from datetime import datetime, timezone
 from ....core.database import execute, fetch, fetchrow, ensure_pool
@@ -78,6 +79,22 @@ async def _ensure_datastore_schemas_table() -> None:
     await execute(
         "ALTER TABLE datastore_schemas ADD COLUMN IF NOT EXISTS label VARCHAR"
     )
+    # Physical Postgres schema the domain model's table lives in. Domain models
+    # that belong to a project are created in that project's own schema (see
+    # ensure_project_schema); the rest — and every table created before this
+    # column existed — stay in "public", which is exactly what the DEFAULT gives.
+    await execute(
+        "ALTER TABLE datastore_schemas ADD COLUMN IF NOT EXISTS pg_schema VARCHAR NOT NULL DEFAULT 'public'"
+    )
+    # Visible name + physical table name of the domain model. table_name stays the
+    # unique internal KEY every API, ABAC rule, attribute and relationship uses;
+    # domain_name is what the user typed and what the table is called inside the
+    # project's schema. Two projects can therefore both have a "Department":
+    # keys "Department" and "Department__5", both with domain_name "Department".
+    # NULL (rows from before this column) means domain_name == table_name.
+    await execute(
+        "ALTER TABLE datastore_schemas ADD COLUMN IF NOT EXISTS domain_name VARCHAR"
+    )
     # Safety net: whenever a domain model row disappears from
     # datastore_schemas (API delete, manual DELETE in DBeaver, a script...),
     # Postgres itself removes its attributes (attribute_translations cascade
@@ -125,6 +142,363 @@ async def _ensure_datastore_schemas_table() -> None:
     _schemas_table_ready = True
 
 
+# ── per-project datastore_schemas ───────────────────────────────
+#
+# Every project gets its OWN datastore_schemas table inside its Postgres schema
+# (bank_management.datastore_schemas) holding only that project's domain models.
+# Domain models without a project stay in public.datastore_schemas.
+#
+# Because most APIs only know a domain model's key (table_name), a tiny
+# directory table public.datastore_registry maps key -> (physical schema,
+# schema holding its datastore_schemas row, project). The registry holds no
+# schema JSON - the real record always lives in the project's own table.
+#
+# Rows created before this change still sit in public.datastore_schemas; the
+# registry is back-filled from them with meta_schema = 'public', so everything
+# keeps working until migrate_domains_to_project_schemas moves them.
+
+_registry_ready = False
+_meta_ready: set[str] = set()
+
+
+async def _ensure_registry() -> None:
+    global _registry_ready
+    if _registry_ready:
+        return
+    await _ensure_datastore_schemas_table()
+    await execute(
+        """
+        CREATE TABLE IF NOT EXISTS datastore_registry (
+            table_name   VARCHAR PRIMARY KEY,
+            pg_schema    VARCHAR NOT NULL DEFAULT 'public',
+            meta_schema  VARCHAR NOT NULL DEFAULT 'public',
+            project_id   INTEGER
+        )
+        """
+    )
+    await backfill_registry()
+    print("[datastore] Directory table 'datastore_registry' ready (PostgreSQL).")
+    _registry_ready = True
+
+
+async def backfill_registry() -> None:
+    """Register every row still in the legacy public.datastore_schemas (idempotent).
+    Also run by the migration script, in case an older instance wrote rows there
+    after the registry was first created."""
+    await execute(
+        "INSERT INTO datastore_registry (table_name, pg_schema, meta_schema, project_id) "
+        "SELECT table_name, COALESCE(pg_schema, 'public'), 'public', project_id "
+        "FROM datastore_schemas ON CONFLICT (table_name) DO NOTHING"
+    )
+
+
+def _meta_ref(meta_schema: str | None) -> str:
+    if not meta_schema or meta_schema == "public":
+        return "datastore_schemas"
+    return f'"{meta_schema}".datastore_schemas'
+
+
+async def _ensure_meta(meta_schema: str | None) -> str:
+    """Make sure <meta_schema>.datastore_schemas exists; return its quoted reference."""
+    if not meta_schema or meta_schema == "public":
+        await _ensure_datastore_schemas_table()
+        return "datastore_schemas"
+    if meta_schema not in _meta_ready:
+        await execute(f'CREATE SCHEMA IF NOT EXISTS "{meta_schema}"')
+        await execute(
+            f"""
+            CREATE TABLE IF NOT EXISTS "{meta_schema}".datastore_schemas (
+                table_name   VARCHAR PRIMARY KEY,
+                schema       TEXT    NOT NULL,
+                created_at   VARCHAR,
+                project_id   INTEGER,
+                module_id    INTEGER,
+                label        VARCHAR,
+                pg_schema    VARCHAR NOT NULL DEFAULT '{meta_schema}',
+                domain_name  VARCHAR
+            )
+            """
+        )
+        _meta_ready.add(meta_schema)
+        print(f"[datastore] '{meta_schema}'.datastore_schemas ready.")
+    return _meta_ref(meta_schema)
+
+
+async def _meta_of(table_name: str) -> str:
+    """Reference of the datastore_schemas table that holds this domain model's row
+    (public one for unregistered keys)."""
+    await _ensure_registry()
+    row = await fetchrow("SELECT meta_schema FROM datastore_registry WHERE table_name = $1", table_name)
+    return await _ensure_meta(row["meta_schema"] if row else "public")
+
+
+async def _meta_schemas() -> list[str]:
+    await _ensure_registry()
+    rows = await fetch("SELECT DISTINCT meta_schema FROM datastore_registry")
+    return sorted({r["meta_schema"] for r in rows} | {"public"})
+
+
+async def _fetch_all_meta(sql: str, *args) -> list:
+    """Run `sql` against every datastore_schemas table. Write the table as {t}."""
+    out: list = []
+    for s in await _meta_schemas():
+        out.extend(await fetch(sql.replace("{t}", await _ensure_meta(s)), *args))
+    return out
+
+
+async def _register(table_name: str, pg_schema: str, meta_schema: str, project_id) -> None:
+    await execute(
+        "INSERT INTO datastore_registry (table_name, pg_schema, meta_schema, project_id) "
+        "VALUES ($1, $2, $3, $4) "
+        "ON CONFLICT (table_name) DO UPDATE SET pg_schema = EXCLUDED.pg_schema, "
+        "meta_schema = EXCLUDED.meta_schema, project_id = EXCLUDED.project_id",
+        table_name, pg_schema or "public", meta_schema or "public",
+        int(project_id) if project_id not in (None, "") else None,
+    )
+
+
+async def move_meta_row(table_name: str, target_schema: str) -> bool:
+    """Move one domain model's datastore_schemas row into <target_schema>.datastore_schemas
+    (used by the migration script and when a model changes project). True if it moved."""
+    src_ref = await _meta_of(table_name)
+    dst_ref = await _ensure_meta(target_schema)
+    if src_ref == dst_ref:
+        return False
+    cols = "table_name, schema, created_at, project_id, module_id, label, domain_name"
+    moved = await fetchrow(f"SELECT 1 FROM {src_ref} WHERE table_name = $1", table_name)
+    if not moved:
+        return False
+    await execute(
+        f"INSERT INTO {dst_ref} ({cols}, pg_schema) "
+        f"SELECT {cols}, $2 FROM {src_ref} WHERE table_name = $1 "
+        f"ON CONFLICT (table_name) DO NOTHING",
+        table_name, target_schema,
+    )
+    await execute(f"DELETE FROM {src_ref} WHERE table_name = $1", table_name)
+    await execute(
+        "UPDATE datastore_registry SET pg_schema = $2, meta_schema = $2 WHERE table_name = $1",
+        table_name, target_schema,
+    )
+    return True
+
+
+async def ensure_project_meta(project_id) -> str | None:
+    """Create the project's schema and its own datastore_schemas table (idempotent).
+    Called when a project is created, so the table exists before the first domain
+    model. Returns the schema name, or None if the project doesn't exist."""
+    await _ensure_registry()
+    schema = await ensure_project_schema(project_id)
+    if schema == "public":
+        return None
+    await _ensure_meta(schema)
+    return schema
+
+
+async def count_domains_in_module(module_id) -> int:
+    rows = await _fetch_all_meta("SELECT COUNT(*) AS n FROM {t} WHERE module_id = $1", int(module_id))
+    return sum(int(r["n"]) for r in rows)
+
+
+async def detach_module_domains(module_ids: list[int]) -> None:
+    for s in await _meta_schemas():
+        t = await _ensure_meta(s)
+        await execute(f"UPDATE {t} SET module_id = NULL WHERE module_id = ANY($1::INTEGER[])", module_ids)
+
+
+# ── per-project Postgres schemas ────────────────────────────────
+#
+# Project "Bank Management" -> schema bank_management, so its domain models are
+# bank_management."Department", bank_management."Branch", ... and DBeaver groups
+# them under the project instead of one flat list in "public".
+#
+# The schema each domain model lives in is recorded in
+# datastore_schemas.pg_schema (and the project's schema in projects.pg_schema),
+# so renaming/deleting a project or running on several workers never has to
+# re-derive it from a name.
+
+_RESERVED_SCHEMAS = {"public", "idam", "information_schema", "pg_catalog", "pg_toast", "crdb_internal"}
+_projects_schema_col_ready = False
+
+
+def _schema_slug(name: str | None) -> str:
+    s = re.sub(r"[^a-z0-9]+", "_", (name or "").lower()).strip("_")[:40].strip("_")
+    if s and s[0].isdigit():
+        s = "p_" + s
+    return s
+
+
+def _qualify(pg_schema: str | None, table_name: str) -> str:
+    """Quoted table reference; "public" stays unqualified (legacy behaviour)."""
+    if pg_schema and pg_schema != "public":
+        return f'"{pg_schema}"."{table_name}"'
+    return f'"{table_name}"'
+
+
+async def _stored_location(table_name: str) -> tuple[str, str] | None:
+    """(pg_schema, physical table name) for a domain-model key, or None if unregistered."""
+    meta = await _meta_of(table_name)
+    row = await fetchrow(
+        "SELECT pg_schema, COALESCE(domain_name, table_name) AS physical "
+        f"FROM {meta} WHERE table_name = $1", table_name)
+    return ((row["pg_schema"] or "public"), row["physical"]) if row else None
+
+
+async def _stored_schema(table_name: str) -> str | None:
+    loc = await _stored_location(table_name)
+    return loc[0] if loc else None
+
+
+async def _ref(table_name: str) -> str:
+    """Schema-qualified, quoted reference to a domain model's physical table
+    (table_name is the internal key; unregistered names fall back to themselves)."""
+    loc = await _stored_location(table_name)
+    return _qualify(*loc) if loc else _qualify("public", table_name)
+
+
+async def schemas_of(table_names: list[str]) -> dict[str, tuple[str, str]]:
+    """{key: (pg_schema, physical table name)} for the given domain models (query builder)."""
+    if not table_names:
+        return {}
+    rows = await _fetch_all_meta(
+        "SELECT table_name, pg_schema, COALESCE(domain_name, table_name) AS physical "
+        "FROM {t} WHERE table_name = ANY($1::varchar[])",
+        list(table_names),
+    )
+    return {r["table_name"]: ((r["pg_schema"] or "public"), r["physical"]) for r in rows}
+
+
+def _same_project(a, b) -> bool:
+    return str(a or "") == str(b or "")
+
+
+async def resolve_for_save(name: str, project_id, is_new: bool = False) -> dict:
+    """Decide what a create/save request for `name` in `project_id` means.
+
+    Names are unique PER PROJECT (case-insensitive). Returns
+      {"key", "domain_name", "exists": bool}              -> go ahead
+      {"conflict": "<message>"}                           -> duplicate, reject
+    `name` may be the visible name or the key of an existing model (the frontend
+    sends back the table_name it was given when it saves edits).
+    """
+    await _ensure_registry()
+    if name.lower() == "datastore_schemas":     # would collide with the per-project meta table
+        return {"conflict": "'datastore_schemas' is a reserved name. Choose a different name."}
+    rows = await _fetch_all_meta(
+        "SELECT table_name, project_id, COALESCE(domain_name, table_name) AS dn "
+        "FROM {t} WHERE lower(table_name) = lower($1) "
+        "OR lower(COALESCE(domain_name, table_name)) = lower($1)", name)
+    mine = [r for r in rows if _same_project(r["project_id"], project_id)]
+    # editing an existing model: exact key, or exact visible name, in this project
+    for r in mine:
+        if r["table_name"] == name or r["dn"] == name:
+            if is_new:
+                return {"conflict": f"A domain model named '{r['dn']}' already exists in this project. Choose a different name."}
+            return {"key": r["table_name"], "domain_name": r["dn"], "exists": True}
+    if mine:   # differs only by letter case
+        return {"conflict": f"A domain model named '{mine[0]['dn']}' already exists in this project. Choose a different name."}
+    # brand-new in this project: the key is the name itself when free, else name__<project>
+    taken = {r["table_name"] for r in await fetch(
+        "SELECT table_name FROM datastore_registry WHERE lower(table_name) LIKE lower($1) || '%'", name)}
+    key, n = name, 0
+    suffix = str(project_id) if project_id not in (None, "") else "np"
+    while key in taken:
+        key = f"{name}__{suffix}" + (f"_{n}" if n else "")
+        n += 1
+    return {"key": key, "domain_name": name, "exists": False}
+
+
+async def find_domains_ci(table_name: str) -> list[dict]:
+    """Registered domain models with this key or visible name (any letter case)."""
+    rows = await _fetch_all_meta(
+        "SELECT table_name, project_id, COALESCE(domain_name, table_name) AS dn FROM {t} "
+        "WHERE lower(table_name) = lower($1) OR lower(COALESCE(domain_name, table_name)) = lower($1)",
+        table_name,
+    )
+    return [{"table_name": r["table_name"], "domain_name": r["dn"],
+             "project_id": str(r["project_id"]) if r["project_id"] is not None else None}
+            for r in rows]
+
+
+async def _ensure_projects_schema_col() -> None:
+    global _projects_schema_col_ready
+    if _projects_schema_col_ready:
+        return
+    await execute("ALTER TABLE projects ADD COLUMN IF NOT EXISTS pg_schema VARCHAR")
+    _projects_schema_col_ready = True
+
+
+async def _pick_schema_name(project_id: int, project_name: str | None, current: str | None = None) -> str:
+    slug = _schema_slug(project_name)
+    candidates = ([slug, f"{slug}_{project_id}"] if slug else []) + [f"project_{project_id}"]
+    for name in candidates:
+        if name in _RESERVED_SCHEMAS or name.startswith("pg_"):
+            continue
+        if name == current:
+            return name
+        in_db = await fetchrow("SELECT 1 FROM pg_catalog.pg_namespace WHERE nspname = $1", name)
+        used = await fetchrow(
+            "SELECT 1 FROM projects WHERE pg_schema = $1 AND id <> $2", name, project_id
+        )
+        if not in_db and not used:
+            return name
+    return f"project_{project_id}"
+
+
+async def project_schema_name(project_id) -> str:
+    """Schema recorded for a project WITHOUT creating anything ("public" if none)."""
+    if project_id in (None, ""):
+        return "public"
+    await _ensure_projects_schema_col()
+    row = await fetchrow("SELECT pg_schema FROM projects WHERE id = $1", int(project_id))
+    return (row["pg_schema"] if row and row["pg_schema"] else "public")
+
+
+async def ensure_project_schema(project_id) -> str:
+    """Create (once) and return the Postgres schema that holds a project's domain
+    models. Falls back to "public" if the project doesn't exist."""
+    if project_id in (None, ""):
+        return "public"
+    pid = int(project_id)
+    await _ensure_projects_schema_col()
+    row = await fetchrow("SELECT name, pg_schema FROM projects WHERE id = $1", pid)
+    if not row:
+        return "public"
+    name = row["pg_schema"] or await _pick_schema_name(pid, row["name"])
+    await execute(f'CREATE SCHEMA IF NOT EXISTS "{name}"')
+    if not row["pg_schema"]:
+        await execute("UPDATE projects SET pg_schema = $2 WHERE id = $1", pid, name)
+        print(f"[datastore] Project {pid} -> schema '{name}'.")
+    return name
+
+
+async def rename_project_schema(project_id, new_project_name: str) -> str | None:
+    """Project renamed: rename its schema to match. Returns the schema name (None =
+    the project has no schema yet; it gets one, named after the new name, on first use)."""
+    pid = int(project_id)
+    await _ensure_projects_schema_col()
+    row = await fetchrow("SELECT pg_schema FROM projects WHERE id = $1", pid)
+    old = row["pg_schema"] if row else None
+    if not old:
+        return None
+    new = await _pick_schema_name(pid, new_project_name, current=old)
+    if new == old:
+        return old
+    await execute(f'ALTER SCHEMA "{old}" RENAME TO "{new}"')
+    await execute("UPDATE projects SET pg_schema = $2 WHERE id = $1", pid, new)
+    # The project's own datastore_schemas table moved with the schema; repoint its rows,
+    # the legacy rows still in public, and the directory.
+    _meta_ready.discard(old)
+    await _ensure_registry()
+    await _ensure_meta(new)
+    await execute(f'UPDATE "{new}".datastore_schemas SET pg_schema = $2 WHERE pg_schema = $1', old, new)
+    await execute("UPDATE datastore_schemas SET pg_schema = $2 WHERE pg_schema = $1", old, new)
+    await execute(
+        "UPDATE datastore_registry SET pg_schema = $2, "
+        "meta_schema = CASE WHEN meta_schema = $1 THEN $2 ELSE meta_schema END "
+        "WHERE pg_schema = $1 OR meta_schema = $1", old, new)
+    return new
+
+
 # ── schema meta-table helpers ────────────────────────────────────
 
 async def save_schema(
@@ -133,43 +507,62 @@ async def save_schema(
     project_id: int | str | None = None,
     module_id: int | str | None = None,
     label: str | None = None,
+    domain_name: str | None = None,
 ) -> None:
-    await _ensure_datastore_schemas_table()
+    await _ensure_registry()
     now = datetime.now(timezone.utc).isoformat()
+    # An existing domain model keeps the schema it physically lives in; a new one
+    # goes into its project's schema, and its datastore_schemas row into that
+    # project's own datastore_schemas table ("public" when it has no project).
+    reg = await fetchrow(
+        "SELECT pg_schema, meta_schema FROM datastore_registry WHERE table_name = $1", table_name)
+    if reg:
+        pg_schema, meta_schema = reg["pg_schema"], reg["meta_schema"]
+    else:
+        pg_schema = await ensure_project_schema(project_id)
+        meta_schema = pg_schema
+    t = await _ensure_meta(meta_schema)
     # Note: project_id is only ever SET on INSERT or when a value is
-    # explicitly passed in — a plain re-save (e.g. adding a field to an
+    # explicitly passed in - a plain re-save (e.g. adding a field to an
     # existing domain model, project_id=None) must not silently detach
     # the domain model from the project it already belongs to.
     await execute(
-        """
-        INSERT INTO datastore_schemas (table_name, schema, created_at, project_id, module_id, label)
-        VALUES ($1, $2, $3, $4, $5, $6)
+        f"""
+        INSERT INTO {t} (table_name, schema, created_at, project_id, module_id, label, pg_schema, domain_name)
+        VALUES ($1, $2, $3, $4, $5, $6, $7, $8)
         ON CONFLICT (table_name) DO UPDATE
             SET schema = EXCLUDED.schema,
                 created_at = EXCLUDED.created_at,
-                project_id = COALESCE(EXCLUDED.project_id, datastore_schemas.project_id),
-                module_id  = COALESCE(EXCLUDED.module_id,  datastore_schemas.module_id),
+                project_id = COALESCE(EXCLUDED.project_id, {t}.project_id),
+                module_id  = COALESCE(EXCLUDED.module_id,  {t}.module_id),
                 -- Same rule as project_id: a plain re-save that sends no
                 -- label must not wipe the label that was typed earlier.
-                label      = COALESCE(EXCLUDED.label,      datastore_schemas.label)
+                label      = COALESCE(EXCLUDED.label,      {t}.label)
         """,
         table_name, json.dumps(schema), now,
         int(project_id) if project_id is not None else None,
         int(module_id) if module_id is not None else None,
         (label.strip() or None) if isinstance(label, str) else None,
+        # Only used when the row is new (ON CONFLICT never rewrites pg_schema).
+        pg_schema,
+        domain_name or table_name,
     )
+    stored = await fetchrow(f"SELECT project_id FROM {t} WHERE table_name = $1", table_name)
+    await _register(table_name, pg_schema, meta_schema, stored["project_id"] if stored else project_id)
 
 
 async def get_schema(table_name: str) -> dict | None:
-    await _ensure_datastore_schemas_table()
+    meta = await _meta_of(table_name)
     row = await fetchrow(
-        "SELECT schema, project_id, module_id, label FROM datastore_schemas WHERE table_name = $1", table_name
+        "SELECT schema, project_id, module_id, label, COALESCE(domain_name, table_name) AS domain_name "
+        f"FROM {meta} WHERE table_name = $1", table_name
     )
     if not row:
         return None
     return {
         "schema":     json.loads(row["schema"]),
         "label":      row["label"],
+        "domain_name": row["domain_name"],
         "db_backend": "postgresql",
         "project_id": str(row["project_id"]) if row["project_id"] is not None else None,
         "module_id":  str(row["module_id"]) if row["module_id"] is not None else None,
@@ -180,7 +573,6 @@ async def list_schemas(
     project_id: int | str | None = None,
     module_id: int | str | None = None,
 ) -> list[dict]:
-    await _ensure_datastore_schemas_table()
     clauses, args = [], []
     if project_id is not None:
         args.append(int(project_id))
@@ -189,14 +581,27 @@ async def list_schemas(
         args.append(int(module_id))
         clauses.append(f"module_id = ${len(args)}")
     where = f"WHERE {' AND '.join(clauses)} " if clauses else ""
-    rows = await fetch(
-        "SELECT table_name, schema, created_at, project_id, module_id, label FROM datastore_schemas "
-        f"{where}ORDER BY created_at DESC",
-        *args,
-    )
+    # A project's models are all in ITS datastore_schemas table (+ public for rows
+    # not migrated yet); with no project filter every table is read.
+    if project_id is not None:
+        await _ensure_registry()
+        proj_schema = await project_schema_name(project_id)
+        schemas = sorted({proj_schema, "public"})
+    else:
+        schemas = await _meta_schemas()
+    rows = []
+    for s in schemas:
+        t = await _ensure_meta(s)
+        rows.extend(await fetch(
+            "SELECT table_name, schema, created_at, project_id, module_id, label, "
+            f"COALESCE(domain_name, table_name) AS domain_name FROM {t} {where}",
+            *args,
+        ))
+    rows.sort(key=lambda r: r["created_at"] or "", reverse=True)
     return [
         {
             "table_name": r["table_name"],
+            "domain_name": r["domain_name"],
             "label":      r["label"],
             "schema":     json.loads(r["schema"]),
             "created_at": str(r["created_at"]) if r["created_at"] else None,
@@ -210,7 +615,20 @@ async def list_schemas(
 
 # ── dynamic table creation ──────────────────────────────────────
 
-async def create_table_from_schema(table_name: str, schema: list) -> dict:
+async def create_table_from_schema(table_name: str, schema: list, project_id: int | str | None = None,
+                                   domain_name: str | None = None) -> dict:
+    # table_name is the internal key; the physical table is called domain_name
+    # (default: the key). A domain model that is already registered stays where
+    # it physically is; a new one goes into its project's schema ("public" when
+    # it has no project).
+    loc = await _stored_location(table_name)
+    if loc:
+        pg_schema, physical = loc
+    else:
+        pg_schema = await ensure_project_schema(project_id)
+        physical = domain_name or table_name
+    tref = _qualify(pg_schema, physical)
+
     pool = await ensure_pool()
     async with pool.acquire() as conn:
 
@@ -218,10 +636,10 @@ async def create_table_from_schema(table_name: str, schema: list) -> dict:
             """
             SELECT EXISTS (
                 SELECT 1 FROM pg_catalog.pg_tables
-                WHERE schemaname = 'public' AND tablename = $1
+                WHERE schemaname = $2 AND tablename = $1
             )
             """,
-            table_name,
+            physical, pg_schema,
         )
 
         if not exists:
@@ -232,16 +650,16 @@ async def create_table_from_schema(table_name: str, schema: list) -> dict:
                 pg_type  = _PG_TYPE.get(field.get("type", "text"), "VARCHAR")
                 col_defs.append(f'"{col_name}" {pg_type}')
 
-            ddl = f'CREATE TABLE "{table_name}" ({", ".join(col_defs)})'
+            ddl = f'CREATE TABLE {tref} ({", ".join(col_defs)})'
             await conn.execute(ddl)
 
             await conn.execute(
-                f'CREATE INDEX IF NOT EXISTS "idx_{table_name}_created_at" '
-                f'ON "{table_name}"(created_at)'
+                f'CREATE INDEX IF NOT EXISTS "idx_{physical}_created_at" '
+                f'ON {tref}(created_at)'
             )
 
-            print(f"[datastore] Table '{table_name}' created in PostgreSQL.")
-            return {"created": True, "table_name": table_name}
+            print(f"[datastore] Table '{table_name}' created in PostgreSQL (schema '{pg_schema}').")
+            return {"created": True, "table_name": table_name, "domain_name": physical, "schema": pg_schema}
 
         else:
             existing_cols = {
@@ -252,12 +670,12 @@ async def create_table_from_schema(table_name: str, schema: list) -> dict:
                     FROM   pg_catalog.pg_attribute a
                     JOIN   pg_catalog.pg_class     c ON c.oid = a.attrelid
                     JOIN   pg_catalog.pg_namespace n ON n.oid = c.relnamespace
-                    WHERE  n.nspname = 'public'
+                    WHERE  n.nspname = $2
                       AND  c.relname = $1
                       AND  a.attnum  > 0
                       AND  NOT a.attisdropped
                     """,
-                    table_name,
+                    physical, pg_schema,
                 )
             }
 
@@ -272,7 +690,7 @@ async def create_table_from_schema(table_name: str, schema: list) -> dict:
             for base_col, base_type in (("created_at", "VARCHAR"), ("deleted_at", "VARCHAR")):
                 if base_col not in existing_cols:
                     await conn.execute(
-                        f'ALTER TABLE "{table_name}" ADD COLUMN IF NOT EXISTS "{base_col}" {base_type}'
+                        f'ALTER TABLE {tref} ADD COLUMN IF NOT EXISTS "{base_col}" {base_type}'
                     )
                     added.append(base_col)
                     print(f"[datastore] Backfilled baseline column '{base_col}' on '{table_name}'.")
@@ -282,7 +700,7 @@ async def create_table_from_schema(table_name: str, schema: list) -> dict:
                 if col_name not in existing_cols:
                     pg_type = _PG_TYPE.get(field.get("type", "text"), "VARCHAR")
                     await conn.execute(
-                        f'ALTER TABLE "{table_name}" ADD COLUMN IF NOT EXISTS "{col_name}" {pg_type}'
+                        f'ALTER TABLE {tref} ADD COLUMN IF NOT EXISTS "{col_name}" {pg_type}'
                     )
                     added.append(col_name)
                     print(f"[datastore] Added column '{col_name}' ({pg_type}) to '{table_name}'.")
@@ -290,7 +708,7 @@ async def create_table_from_schema(table_name: str, schema: list) -> dict:
             if added:
                 print(f"[datastore] '{table_name}' updated — added {len(added)} column(s): {added}")
 
-            return {"created": False, "table_name": table_name}
+            return {"created": False, "table_name": table_name, "domain_name": physical, "schema": pg_schema}
 
 
 # ── row insert ──────────────────────────────────────────────────
@@ -325,7 +743,7 @@ async def insert_row(table_name: str, schema: list, row_data: dict) -> str:
     pool = await ensure_pool()
     async with pool.acquire() as conn:
         record_id = await conn.fetchval(
-            f'INSERT INTO "{table_name}" ({col_str}) VALUES ({placeholders}) RETURNING id',
+            f'INSERT INTO {await _ref(table_name)} ({col_str}) VALUES ({placeholders}) RETURNING id',
             *vals
         )
     return str(record_id)
@@ -335,19 +753,19 @@ async def insert_row(table_name: str, schema: list, row_data: dict) -> str:
 
 async def list_rows(table_name: str, include_deleted: bool = False) -> list[dict]:
     if include_deleted:
-        rows = await fetch(f'SELECT * FROM "{table_name}" ORDER BY created_at DESC')
+        rows = await fetch(f'SELECT * FROM {await _ref(table_name)} ORDER BY created_at DESC')
     else:
-        rows = await fetch(f'SELECT * FROM "{table_name}" WHERE deleted_at IS NULL ORDER BY created_at DESC')
+        rows = await fetch(f'SELECT * FROM {await _ref(table_name)} WHERE deleted_at IS NULL ORDER BY created_at DESC')
     return [_stringify_id(dict(r)) for r in rows]
 
 async def list_archived_rows(table_name: str) -> list[dict]:
     rows = await fetch(
-        f'SELECT * FROM "{table_name}" WHERE deleted_at IS NOT NULL ORDER BY deleted_at DESC'
+        f'SELECT * FROM {await _ref(table_name)} WHERE deleted_at IS NOT NULL ORDER BY deleted_at DESC'
     )
     return [_stringify_id(dict(r)) for r in rows]
 
 async def get_row(table_name: str, record_id: str) -> dict | None:
-    row = await fetchrow(f'SELECT * FROM "{table_name}" WHERE id = $1', int(record_id))
+    row = await fetchrow(f'SELECT * FROM {await _ref(table_name)} WHERE id = $1', int(record_id))
     return _stringify_id(dict(row)) if row else None
 
 
@@ -357,10 +775,15 @@ async def update_row(table_name: str, record_id: str, row_data: dict) -> dict:
     if not row_data:
         return {"status": "error", "message": "No data provided"}
 
+    meta = await _meta_of(table_name)
     schema_row = await fetchrow(
-        "SELECT schema FROM datastore_schemas WHERE table_name = $1", table_name
+        "SELECT schema, pg_schema, COALESCE(domain_name, table_name) AS physical "
+        f"FROM {meta} WHERE table_name = $1", table_name
     )
     schema = json.loads(schema_row["schema"]) if schema_row else []
+    pg_schema = (schema_row["pg_schema"] if schema_row else None) or "public"
+    physical = (schema_row["physical"] if schema_row else None) or table_name
+    tref = _qualify(pg_schema, physical)
 
     # Check if table has versionOf column (versioned table)
     pool = await ensure_pool()
@@ -372,10 +795,10 @@ async def update_row(table_name: str, record_id: str, row_data: dict) -> dict:
                 SELECT a.attname FROM pg_catalog.pg_attribute a
                 JOIN pg_catalog.pg_class c ON c.oid = a.attrelid
                 JOIN pg_catalog.pg_namespace n ON n.oid = c.relnamespace
-                WHERE n.nspname = 'public' AND c.relname = $1
+                WHERE n.nspname = $2 AND c.relname = $1
                 AND a.attnum > 0 AND NOT a.attisdropped
                 """,
-                table_name,
+                physical, pg_schema,
             )
         }
 
@@ -386,13 +809,13 @@ async def update_row(table_name: str, record_id: str, row_data: dict) -> dict:
 
             # 1. Mark old row inactive
             await conn.execute(
-                f'UPDATE "{table_name}" SET "toDate" = $1, "isActive" = $2 WHERE id = $3',
+                f'UPDATE {tref} SET "toDate" = $1, "isActive" = $2 WHERE id = $3',
                 now, False, int(record_id)
             )
 
             # 2. Get old row data to copy into new row
             old_row = await conn.fetchrow(
-                f'SELECT * FROM "{table_name}" WHERE id = $1', int(record_id)
+                f'SELECT * FROM {tref} WHERE id = $1', int(record_id)
             )
             old_dict = dict(old_row) if old_row else {}
 
@@ -420,7 +843,7 @@ async def update_row(table_name: str, record_id: str, row_data: dict) -> dict:
             placeholders = ", ".join(f"${i + 1}" for i in range(len(vals)))
 
             new_id = await conn.fetchval(
-                f'INSERT INTO "{table_name}" ({col_str}) VALUES ({placeholders}) RETURNING id',
+                f'INSERT INTO {tref} ({col_str}) VALUES ({placeholders}) RETURNING id',
                 *vals
             )
             return {"status": "success", "record_id": str(new_id), "versioned": True, "previous_id": record_id}
@@ -451,7 +874,7 @@ async def update_row(table_name: str, record_id: str, row_data: dict) -> dict:
 
         async with pool.acquire() as conn:
             await conn.execute(
-                f'UPDATE "{table_name}" SET {set_clause} WHERE id = ${len(vals)}',
+                f'UPDATE {tref} SET {set_clause} WHERE id = ${len(vals)}',
                 *vals
             )
         return {"status": "success", "record_id": record_id}
@@ -463,7 +886,7 @@ async def delete_row(table_name: str, record_id: str) -> dict:
     pool = await ensure_pool()
     async with pool.acquire() as conn:
         await conn.execute(
-            f'UPDATE "{table_name}" SET deleted_at = $1 WHERE id = $2',
+            f'UPDATE {await _ref(table_name)} SET deleted_at = $1 WHERE id = $2',
             now, int(record_id)
         )
     return {"status": "success", "record_id": record_id}
@@ -476,7 +899,7 @@ async def restore_row(table_name: str, record_id: str) -> dict:
         pool = await ensure_pool()
         async with pool.acquire() as conn:
             result = await conn.execute(
-                f'UPDATE "{table_name}" SET deleted_at = NULL '
+                f'UPDATE {await _ref(table_name)} SET deleted_at = NULL '
                 f'WHERE id = $1 AND deleted_at IS NOT NULL',
                 int(record_id),
             )
@@ -923,11 +1346,14 @@ async def delete_domain(table_name: str, drop_table: bool = True) -> dict:
         await _ensure_datastore_schemas_table()
         await _ensure_domain_attributes_table()
         await _ensure_attribute_translations_table()   # translations cascade from attributes
+        meta = await _meta_of(table_name)
         existing = await fetchrow(
-            "SELECT 1 FROM datastore_schemas WHERE table_name = $1", table_name
+            "SELECT pg_schema, COALESCE(domain_name, table_name) AS physical "
+            f"FROM {meta} WHERE table_name = $1", table_name
         )
         if not existing:
             return {"status": "error", "code": 404, "message": f"Domain '{table_name}' not found"}
+        tref = _qualify(existing["pg_schema"], existing["physical"])   # before the row is deleted
 
         # Check for the optional relationships table OUTSIDE the transaction.
         # A fetchval/fetchrow inside it leaves a suspended portal open, and
@@ -947,9 +1373,10 @@ async def delete_domain(table_name: str, drop_table: bool = True) -> dict:
                         "DELETE FROM domain_relationships WHERE from_dmo = $1 OR to_dmo = $1",
                         table_name,
                     )
-                await conn.execute("DELETE FROM datastore_schemas WHERE table_name = $1", table_name)
+                await conn.execute(f"DELETE FROM {meta} WHERE table_name = $1", table_name)
+                await conn.execute("DELETE FROM datastore_registry WHERE table_name = $1", table_name)
                 if drop_table:
-                    await conn.execute(f'DROP TABLE IF EXISTS "{table_name}"')
+                    await conn.execute(f'DROP TABLE IF EXISTS {tref}')
         print(f"[datastore] Domain '{table_name}' deleted with its attributes "
               f"({attrs}); drop_table={drop_table}.")
         return {"status": "success", "table_name": table_name, "table_dropped": drop_table}
@@ -961,68 +1388,112 @@ async def purge_orphan_attributes() -> dict:
     """One-off cleanup: delete domain_attributes (and their translations) whose
     domain no longer exists in datastore_schemas, plus dangling relationships.
     Safe to call any time (e.g. from an admin route)."""
-    await _ensure_datastore_schemas_table()
+    await _ensure_registry()
     await _ensure_domain_attributes_table()
     await _ensure_attribute_translations_table()
     attrs = await execute(
-        "DELETE FROM domain_attributes WHERE dmo_name NOT IN (SELECT table_name FROM datastore_schemas)"
+        "DELETE FROM domain_attributes WHERE dmo_name NOT IN (SELECT table_name FROM datastore_registry)"
     )
     rels = "DELETE 0"
     _rel = await fetchrow("SELECT to_regclass('domain_relationships') AS t")
     if _rel and _rel["t"]:
         rels = await execute(
             "DELETE FROM domain_relationships "
-            "WHERE from_dmo NOT IN (SELECT table_name FROM datastore_schemas) "
-            "OR to_dmo NOT IN (SELECT table_name FROM datastore_schemas)"
+            "WHERE from_dmo NOT IN (SELECT table_name FROM datastore_registry) "
+            "OR to_dmo NOT IN (SELECT table_name FROM datastore_registry)"
         )
     return {"status": "success", "attributes_removed": attrs, "relationships_removed": rels}
 
 
 async def rename_domain(
     old_name: str,
-    new_name: str,
+    new_name: str | None,
     project_id: int | str | None = None,
     module_id: int | str | None = None,
     move_scope: bool = False,
     label: str | None = None,
     update_label: bool = False,
 ) -> dict:
-    """Rename a domain model (table + schema row + attribute rows) and/or
-    move it to another project/module (move_scope=True; None clears) and/or
-    change its business label (update_label=True; empty/None clears)."""
+    """Rename a domain model (visible name + physical table) and/or move it to
+    another project/module (move_scope=True; None clears) and/or change its
+    business label (update_label=True; empty/None clears).
+
+    old_name is the model's internal key. new_name=None means "don't rename".
+    Names are unique per project (case-insensitive). The key itself only changes
+    when the new name is free as a key (the old behaviour for models whose key
+    equals their name); otherwise it stays and only domain_name changes."""
     try:
         _check_ident(old_name, "table name")
-        _check_ident(new_name, "new table name")
-        await _ensure_datastore_schemas_table()
-        if not await fetchrow("SELECT 1 FROM datastore_schemas WHERE table_name = $1", old_name):
+        if new_name:
+            _check_ident(new_name, "new table name")
+        meta = await _meta_of(old_name)
+        cur = await fetchrow(
+            "SELECT pg_schema, project_id, COALESCE(domain_name, table_name) AS dn "
+            f"FROM {meta} WHERE table_name = $1", old_name)
+        if not cur:
             return {"status": "error", "code": 404, "message": f"Domain '{old_name}' not found"}
+        cur_schema = cur["pg_schema"] or "public"
+        visible = cur["dn"]
+        key = old_name
 
-        if new_name != old_name:
-            if await fetchrow("SELECT 1 FROM datastore_schemas WHERE table_name = $1", new_name):
-                return {"status": "error", "code": 409, "message": f"A domain named '{new_name}' already exists"}
-            await execute(f'ALTER TABLE IF EXISTS "{old_name}" RENAME TO "{new_name}"')
-            await execute("UPDATE datastore_schemas SET table_name = $1 WHERE table_name = $2", new_name, old_name)
-            await _ensure_domain_attributes_table()
-            await execute("UPDATE domain_attributes SET dmo_name = $1 WHERE dmo_name = $2", new_name, old_name)
-            _rel = await fetchrow("SELECT to_regclass('domain_relationships') AS t")
-            if _rel and _rel["t"]:
-                await execute("UPDATE domain_relationships SET from_dmo = $1 WHERE from_dmo = $2", new_name, old_name)
-                await execute("UPDATE domain_relationships SET to_dmo = $1 WHERE to_dmo = $2", new_name, old_name)
+        new_project = (int(project_id) if project_id not in (None, "") else None) if move_scope else cur["project_id"]
+        renaming = bool(new_name) and new_name != visible
+        if renaming or move_scope:
+            target_name = new_name if renaming else visible
+            clashes = await _fetch_all_meta(
+                "SELECT COALESCE(domain_name, table_name) AS dn FROM {t} "
+                "WHERE table_name <> $1 AND lower(COALESCE(domain_name, table_name)) = lower($2) "
+                "AND project_id IS NOT DISTINCT FROM $3::int",
+                old_name, target_name, new_project)
+            clash = clashes[0] if clashes else None
+            if clash:
+                return {"status": "error", "code": 409,
+                        "message": f"A domain model named '{clash['dn']}' already exists in this project. Choose a different name."}
+
+        if renaming:
+            await execute(f'ALTER TABLE IF EXISTS {_qualify(cur_schema, visible)} RENAME TO "{new_name}"')
+            await execute(f"UPDATE {meta} SET domain_name = $1 WHERE table_name = $2", new_name, key)
+            visible = new_name
+            # keep the key in step with the name when that key is free (legacy behaviour)
+            if new_name != key and not await fetchrow(
+                    "SELECT 1 FROM datastore_registry WHERE table_name = $1", new_name):
+                await execute(f"UPDATE {meta} SET table_name = $1 WHERE table_name = $2", new_name, key)
+                await execute("UPDATE datastore_registry SET table_name = $1 WHERE table_name = $2", new_name, key)
+                await _ensure_domain_attributes_table()
+                await execute("UPDATE domain_attributes SET dmo_name = $1 WHERE dmo_name = $2", new_name, key)
+                _rel = await fetchrow("SELECT to_regclass('domain_relationships') AS t")
+                if _rel and _rel["t"]:
+                    await execute("UPDATE domain_relationships SET from_dmo = $1 WHERE from_dmo = $2", new_name, key)
+                    await execute("UPDATE domain_relationships SET to_dmo = $1 WHERE to_dmo = $2", new_name, key)
+                key = new_name
 
         if move_scope:
+            # Moving to another project moves the physical table to that
+            # project's schema (or back to "public" when detached).
+            target = await ensure_project_schema(project_id)
+            if target != cur_schema:
+                await execute(f'ALTER TABLE IF EXISTS {_qualify(cur_schema, visible)} SET SCHEMA "{target}"')
+            # The model's datastore_schemas row follows it into the new project's own
+            # datastore_schemas table (this also adopts rows still in the legacy public table).
+            await move_meta_row(key, target)
+            meta = await _meta_of(key)
+            await execute(f"UPDATE {meta} SET pg_schema = $1 WHERE table_name = $2", target, key)
             await execute(
-                "UPDATE datastore_schemas SET project_id = $1, module_id = $2 WHERE table_name = $3",
-                int(project_id) if project_id not in (None, "") else None,
+                f"UPDATE {meta} SET project_id = $1, module_id = $2 WHERE table_name = $3",
+                new_project,
                 int(module_id) if module_id not in (None, "") else None,
-                new_name,
+                key,
             )
+            await execute(
+                "UPDATE datastore_registry SET pg_schema = $1, project_id = $2 WHERE table_name = $3",
+                target, new_project, key)
         if update_label:
             clean = label.strip() if isinstance(label, str) else ""
             await execute(
-                "UPDATE datastore_schemas SET label = $1 WHERE table_name = $2",
-                clean or None, new_name,
+                f"UPDATE {meta} SET label = $1 WHERE table_name = $2",
+                clean or None, key,
             )
-        return {"status": "success", "table_name": new_name, "old_name": old_name}
+        return {"status": "success", "table_name": key, "domain_name": visible, "old_name": old_name}
     except Exception as e:
         return {"status": "error", "code": 400, "message": str(e)}
 
@@ -1043,9 +1514,9 @@ async def delete_field(table_name: str, field_id: str) -> dict:
         if len(new_schema) == len(schema):
             return {"status": "error", "code": 404, "message": f"Field '{field_id}' not found in '{table_name}'"}
 
-        await execute(f'ALTER TABLE IF EXISTS "{table_name}" DROP COLUMN IF EXISTS "{field_id}"')
+        await execute(f'ALTER TABLE IF EXISTS {await _ref(table_name)} DROP COLUMN IF EXISTS "{field_id}"')
         await execute(
-            "UPDATE datastore_schemas SET schema = $1 WHERE table_name = $2",
+            f"UPDATE {await _meta_of(table_name)} SET schema = $1 WHERE table_name = $2",
             json.dumps(new_schema), table_name,
         )
         await _ensure_domain_attributes_table()
@@ -1089,14 +1560,14 @@ async def update_field(
             return {"status": "error", "code": 409, "message": f"Field '{target}' already exists in '{table_name}'"}
 
         if target != field_id:
-            await execute(f'ALTER TABLE IF EXISTS "{table_name}" RENAME COLUMN "{field_id}" TO "{target}"')
+            await execute(f'ALTER TABLE IF EXISTS {await _ref(table_name)} RENAME COLUMN "{field_id}" TO "{target}"')
             entry["field_id"] = target
         if new_type and new_type != entry.get("type"):
             pg_type = _PG_TYPE.get(new_type)
             if not pg_type:
                 return {"status": "error", "code": 400, "message": f"Unsupported type '{new_type}'"}
             await execute(
-                f'ALTER TABLE IF EXISTS "{table_name}" ALTER COLUMN "{target}" TYPE {pg_type} '
+                f'ALTER TABLE IF EXISTS {await _ref(table_name)} ALTER COLUMN "{target}" TYPE {pg_type} '
                 f'USING "{target}"::{pg_type}'
             )
             entry["type"] = new_type
@@ -1104,7 +1575,7 @@ async def update_field(
             entry["label"] = new_label
 
         await execute(
-            "UPDATE datastore_schemas SET schema = $1 WHERE table_name = $2",
+            f"UPDATE {await _meta_of(table_name)} SET schema = $1 WHERE table_name = $2",
             json.dumps(schema), table_name,
         )
         if target != field_id:

@@ -28,12 +28,13 @@ async def save_schema(
     project_id: int | str | None = None,
     module_id: int | str | None = None,
     label: str | None = None,
+    domain_name: str | None = None,
 ) -> None:
     # project_id / module_id / label (Projects + Modules + business label)
     # are currently PostgreSQL-only.
     if _backend == "dynamodb":
         return await _repo().save_schema(table_name, schema)
-    return await _repo().save_schema(table_name, schema, project_id, module_id, label)
+    return await _repo().save_schema(table_name, schema, project_id, module_id, label, domain_name)
 
 
 async def get_schema(table_name: str) -> list | None:
@@ -50,8 +51,27 @@ async def list_schemas(
     return await _repo().list_schemas(project_id, module_id)
 
 
-async def create_table_from_schema(table_name: str, schema: list) -> dict:
-    return await _repo().create_table_from_schema(table_name, schema)
+async def create_table_from_schema(table_name: str, schema: list, project_id: int | str | None = None,
+                                   domain_name: str | None = None) -> dict:
+    # project_id puts the table in that project's own PostgreSQL schema;
+    # DynamoDB has no schemas, so it never receives it.
+    if _backend == "dynamodb":
+        return await _repo().create_table_from_schema(table_name, schema)
+    return await _repo().create_table_from_schema(table_name, schema, project_id, domain_name)
+
+
+async def find_domains_ci(table_name: str) -> list[dict]:
+    """Existing domain models with this name (case-insensitive). PostgreSQL only."""
+    if _backend == "dynamodb":
+        return []
+    return await _repo().find_domains_ci(table_name)
+
+
+async def resolve_for_save(name: str, project_id=None, is_new: bool = False) -> dict:
+    """Per-project name check -> {key, domain_name, exists} or {conflict}. PostgreSQL only."""
+    if _backend == "dynamodb":
+        return {"key": name, "domain_name": name, "exists": False}
+    return await _repo().resolve_for_save(name, project_id, is_new)
 
 
 async def insert_row(table_name: str, schema: list, row_data: dict) -> str:
@@ -167,6 +187,8 @@ __all__ = [
     "get_schema",
     "list_schemas",
     "create_table_from_schema",
+    "find_domains_ci",
+    "resolve_for_save",
     "insert_row",
     "list_rows",
     "list_archived_rows",

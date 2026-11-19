@@ -198,8 +198,15 @@ async def _resolve_and_generate(query_json: dict) -> tuple[str, list]:
     except ValueError as e:
         raise HTTPException(status_code=400, detail=str(e))
 
+    # Domain models of a project live in that project's PostgreSQL schema.
+    from ..db.repositories.postgres.datastore_repo import schemas_of
+    dmos = set(query_json["objects"])
+    for edge in join_plan:
+        dmos.update((edge.left_dmo, edge.right_dmo))
+    schema_by_dmo = await schemas_of(sorted(dmos))
+
     try:
-        sql_text, params = SqlGenerator(query_json, join_plan).generate()
+        sql_text, params = SqlGenerator(query_json, join_plan, schema_by_dmo).generate()
     except SqlGenerationError as e:
         raise HTTPException(status_code=400, detail=str(e))
 
@@ -315,4 +322,3 @@ async def execute_saved_query(query_definition_id: int, request: Request):
     }
 
 # Mohan Dev Ends ---->
-0

@@ -49,9 +49,14 @@ def _quote(identifier: str) -> str:
 
 
 class SqlGenerator:
-    def __init__(self, query_json: dict, join_plan: list[JoinEdge]):
+    def __init__(self, query_json: dict, join_plan: list[JoinEdge],
+                 schema_by_dmo: dict[str, tuple[str, str]] | None = None):
         self.q = query_json
         self.join_plan = join_plan
+        # {dmo key: (postgres schema, physical table name)}. Domain models of a
+        # project live in that project's schema and the table is named after the
+        # model's visible name. Missing -> the key itself in the default schema.
+        self.schema_by_dmo = schema_by_dmo or {}
         self._alias_by_dmo: dict[str, str] = {}
         self._params: list = []
 
@@ -71,6 +76,14 @@ class SqlGenerator:
                 if dmo not in self._alias_by_dmo:
                     self._alias_by_dmo[dmo] = f"t{i}"
                     i += 1
+
+    def _table(self, dmo: str) -> str:
+        """Quoted (schema-qualified when needed) table reference for a domain object."""
+        schema, physical = self.schema_by_dmo.get(dmo) or ("public", dmo)
+        physical = _check_identifier(physical, "table")
+        if schema and schema != "public":
+            return f"{_quote(_check_identifier(schema, 'schema'))}.{_quote(physical)}"
+        return _quote(physical)
 
     def _alias(self, dmo: str) -> str:
         _check_identifier(dmo, "domain object")
@@ -122,7 +135,7 @@ class SqlGenerator:
 
     def _build_from_join(self) -> str:
         root_dmo = self.q["objects"][0]
-        sql = f'FROM {_quote(root_dmo)} {self._alias(root_dmo)}'
+        sql = f'FROM {self._table(root_dmo)} {self._alias(root_dmo)}'
         for edge in self.join_plan:
             left_alias = self._alias(edge.left_dmo)
             right_alias = self._alias(edge.right_dmo)
@@ -136,7 +149,7 @@ class SqlGenerator:
                 on_left = f"{right_alias}.{_quote(edge.right_field)}"
                 on_right = f"{left_alias}.{_quote(edge.left_field)}"
             self._joined_so_far.add(new_dmo)
-            sql += f'\nJOIN {_quote(new_dmo)} {new_alias} ON {on_left} = {on_right}'
+            sql += f'\nJOIN {self._table(new_dmo)} {new_alias} ON {on_left} = {on_right}'
         return sql
 
     def _build_condition_clause(self, dmo: str, field: str, operator: str, value) -> str:

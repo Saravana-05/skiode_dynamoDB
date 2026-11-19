@@ -87,6 +87,28 @@ async def create_project(payload: dict, current_user: dict | None = None) -> dic
     result = {"status": "success", "data": project}
     created_by = current_user
 
+    # Every project gets its own datastore_schemas table (in the project's own
+    # Postgres schema) that stores only that project's domain models. If this
+    # fails the project is still usable: it is created lazily on the first model.
+    from ..core.config import settings
+    if settings.DB_BACKEND == "postgresql":
+        try:
+            from ..db.repositories.postgres import datastore_repo
+            await datastore_repo.ensure_project_meta(project["id"])
+        except Exception as exc:
+            print(f"[projects] could not create datastore_schemas for project {project['id']}: {exc}")
+
+        # ...and an "IDAM" module holding a "User" domain model (first name, last name,
+        # email, password) that is linked to login - see services/idam_user_model.py.
+        try:
+            from . import idam_user_model
+            idam = await idam_user_model.ensure_idam_user_model(project["id"])
+            result["idam_user_model"] = idam
+        except Exception as exc:
+            print(f"[projects] could not create IDAM User model for project {project['id']}: {exc}")
+            result["warning"] = ("Project created, but its IDAM > User model could not be created: "
+                                 f"{exc}")
+
     # Every project gets its own (empty) user table. Users entered into it are
     # linked to RBAC - see project_user_repo. A failure here (e.g. idam tables
     # not initialised yet) must not lose the project: the table is re-created
@@ -143,6 +165,12 @@ async def update_project(project_id: str, payload: dict) -> dict:
             await project_user_repo.rename_table(project_id, project["name"])
         except Exception as exc:
             print(f"[projects] could not rename user table of project {project_id}: {exc}")
+        # ...and so is the schema holding the project's domain models.
+        try:
+            from ..db.repositories.postgres import datastore_repo
+            await datastore_repo.rename_project_schema(project_id, project["name"])
+        except Exception as exc:
+            print(f"[projects] could not rename domain schema of project {project_id}: {exc}")
     return {"status": "success", "data": project}
 
 
