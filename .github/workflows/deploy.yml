@@ -41,19 +41,18 @@ jobs:
           username: ${{ secrets.SERVER_USER }}
           password: ${{ secrets.SERVER_PASSWORD }}
           script: |
+            set -e
             IMAGE=${{ env.DOCKERHUB_USER }}/${{ env.IMAGE_NAME }}:${{ env.IMAGE_TAG }}
             ENV_FILE=/home/dev/skiode_dynamoDB/.env
-            CERT_FILE=/home/dev/skiode_dynamoDB/certs/root.crt
 
             docker pull "$IMAGE"
             docker rm -f skiode-backend || true
             docker run -d \
               --name skiode-backend \
-              -p 8080:8000 \
+              --network host \
               --env-file "$ENV_FILE" \
               -e ALLOW_ANONYMOUS_VIEW=true \
               -e ALLOW_ANONYMOUS_WRITE=true \
-              -v "$CERT_FILE:/certs/root.crt:ro" \
               --restart unless-stopped \
               "$IMAGE"
 
