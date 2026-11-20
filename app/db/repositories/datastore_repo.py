@@ -115,6 +115,10 @@ async def save_domain_attribute(
     )
 
 
+async def set_attribute_field_types(domain_model_id: str, schema: list) -> None:
+    return await _repo().set_attribute_field_types(domain_model_id, schema)
+
+
 async def list_domain_attributes(domain_model_id: str) -> list[dict]:
     return await _repo().list_domain_attributes(domain_model_id)
 
@@ -197,6 +201,7 @@ __all__ = [
     "delete_row",
     "restore_row",
     "save_domain_attribute",
+    "set_attribute_field_types",
     "list_domain_attributes",
     "save_attribute_translation",
     "get_domain_translations",
