@@ -33,6 +33,7 @@ _PG_TYPE = {
     "date":          "TIMESTAMPTZ",
     "number":        "NUMERIC",
     "boolean":       "BOOLEAN",
+    "domain_model":  "TEXT",
 }
 
 _IDENTIFIER_RE = re.compile(r"^[A-Za-z_][A-Za-z0-9_]*$")
@@ -302,3 +303,7 @@ async def get_row(table_name: str, record_id: str) -> dict | None:
     safe_table = _safe_identifier(table_name)
     row = await fetchrow(f'SELECT * FROM "{safe_table}" WHERE id = $1', record_id)
     return clean(dict(row)) if row else None
+
+async def set_attribute_field_types(domain_model_id: str, schema: list) -> None:
+    """No-op on DynamoDB — the field type already lives in the stored schema."""
+    return None

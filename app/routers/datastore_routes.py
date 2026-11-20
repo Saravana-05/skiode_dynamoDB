@@ -199,7 +199,7 @@ def _validate_row(schema: list[dict], row_data: dict) -> dict[str, str]:
 
 class SchemaField(BaseModel):
     field_id: str
-    type: str               # text | number | formattedText | boolean | date
+    type: str               # text | number | formattedText | boolean | date | domain_model
     label: str
     value: Any = None       # optional default value
 
@@ -409,6 +409,11 @@ async def create_table(body: CreateTableRequest, request: Request):
 
     # 2. Save / update schema metadata
     await save_schema(table_key, schema, project_id, module_id, body.label, domain_name)
+
+    # 3. Persist each field's type (incl. "domain_model") in domain_attributes
+    if not is_dynamo:
+        from ..db.repositories.datastore_repo import set_attribute_field_types
+        await set_attribute_field_types(table_key, schema)
 
     action = "created" if result["created"] else "already existed"
 

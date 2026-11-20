@@ -25,6 +25,10 @@ _PG_TYPE = {
     "date":          "VARCHAR",
     "number":        "NUMERIC",
     "boolean":       "BOOLEAN",
+    # A field tagged as a domain model: logical type is "domain_model" (kept in
+    # the saved schema + domain_attributes.field_type); physically it holds the
+    # related record's id, so the column is VARCHAR like the other id columns.
+    "domain_model":  "VARCHAR",
 }
 
 
@@ -944,6 +948,28 @@ async def _ensure_domain_attributes_table() -> None:
     )
     print("[datastore] Meta-table 'domain_attributes' ready (PostgreSQL).")
     _domain_attributes_table_ready = True
+
+
+async def set_attribute_field_types(domain_model_id: str, schema: list) -> None:
+    """Record each schema field's type in domain_attributes.field_type (so a
+    domain-model field is stored as "domain_model"). Only field_type is written —
+    labels already saved for the attribute are left untouched."""
+    await _ensure_domain_attributes_table()
+    now = datetime.now(timezone.utc).isoformat()
+    for f in schema:
+        fid = f.get("field_id")
+        if not fid:
+            continue
+        await execute(
+            """
+            INSERT INTO domain_attributes
+                (dmo_name, dmo_attribute_name, label, field_type, created_at)
+            VALUES ($1, $2, $3, $4, $5)
+            ON CONFLICT (dmo_name, dmo_attribute_name) DO UPDATE
+                SET field_type = EXCLUDED.field_type
+            """,
+            domain_model_id, fid, f.get("label") or fid, f.get("type", "text"), now,
+        )
 
 
 async def save_domain_attribute(
